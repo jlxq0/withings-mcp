@@ -1,0 +1,81 @@
+[package]
+name = "withings-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "First-party streamable-HTTP MCP server for Withings body metrics"
+license = "MIT"
+repository = "https://forge.oddie.app/jlxq0/withings-mcp"
+publish = false
+
+[dependencies]
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "rt", "signal", "net", "time", "sync"] }
+axum = "0.7"
+# Prometheus metrics, text-format only (drops the vulnerable protobuf 2.x dep).
+prometheus = { version = "0.13", default-features = false }
+# Token-bucket rate limiting. Per-key buckets use sha256(bearer)[..16].
+governor = "0.7"
+http = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry tracing export. Active only when OTEL_EXPORTER_OTLP_ENDPOINT
+# is set. Version skew is real: tracing-opentelemetry 0.32 <-> opentelemetry
+# 0.31 — do not bump independently.
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+# rustls-only HTTP client for the Withings API.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# SHA-256 of bearer values for audit keys — never store the raw token as a key.
+sha2 = "0.10"
+# Constant-time comparison of the inbound bearer and the OAuth `state`.
+subtle = "2.6"
+# Official MCP Rust SDK. `transport-streamable-http-server` enables the
+# session manager + http transport we mount via `Router::nest_service`.
+# rmcp re-exports `schemars` (1.x) — we use `rmcp::schemars`, never a
+# separately-versioned schemars dep.
+rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
+# `futures` is transitive via rmcp; listed so session.rs can name `Stream`.
+futures = { version = "0.3", default-features = false }
+# Hex-encode token-hash audit keys.
+hex = "0.4"
+# Base URL parsing and joining for the Withings client.
+url = "2.5"
+
+[dev-dependencies]
+# Mock the Withings REST endpoints in tests.
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"
+unimplemented = "warn"
+todo = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[lints.rust]
+unsafe_code = "forbid"
