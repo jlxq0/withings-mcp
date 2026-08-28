@@ -122,6 +122,26 @@ Required regression coverage:
   no write-back, reachable without a restart. Do not remove either on the
   grounds that the other exists.
 
+- **The gate covers every mutation of the store, not only refreshes**, and the
+  first version of this file covered only refreshes. `seed_refresh_token`,
+  `adopt` and the whole refresh-persist-read-back-return sequence take
+  `store_gate`. The hole a refresh-only gate leaves: `/oauth/callback` adopting
+  a new authorisation between a refresh's read-back and its return leaves the
+  store holding a token that does not match the access token just handed out,
+  so the atomicity `persist_before_use` exists to provide is gone while every
+  individual step looks correct. Found in cross-engine review of `token.rs`,
+  2026-08-29, by asking one specific question about the new code rather than
+  for a review of it.
+
+  `an_adopt_cannot_interleave_with_a_refresh` pins it by ordering: the refresh
+  is delayed 300 ms, the adopt is issued 50 ms in, and the recorded write order
+  must be seed, refresh, adopt. **Taking the gate back out of `adopt` reds
+  exactly that test**, measured 2026-08-29: 72 passed, 1 failed.
+
+  **The gate is per manager, so one `TokenStore` must not be shared by two.**
+  Two managers over one store have two mutexes and none of this holds. There is
+  one manager per process and nothing in the type enforces it.
+
 - **Withings answers HTTP 200 for application errors.** The real outcome is in
   the body's `status` field, so a check on the HTTP status alone reports
   success for an expired token. `read_envelope` is the only place either layer
