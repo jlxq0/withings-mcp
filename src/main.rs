@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let bind_addr = config.bind_addr;
     let metrics_bind_addr = config.metrics_bind_addr;
-    let app = build_app(&config).await?;
+    let app = build_app(&config)?;
 
     let listener = TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "withings-mcp listening (public)");
@@ -97,7 +97,7 @@ fn build_token_store(path: Option<&std::path::Path>) -> Box<dyn TokenStore> {
     Box::new(FileStore::new(path))
 }
 
-async fn build_app(config: &Config) -> Result<Router> {
+fn build_app(config: &Config) -> Result<Router> {
     let withings = WithingsClient::new(&config.api_base_url)?;
     let store = build_token_store(config.token_state_path.as_deref());
     let tokens = Arc::new(TokenManager::new(
@@ -107,10 +107,8 @@ async fn build_app(config: &Config) -> Result<Router> {
             client_secret: config.client_secret.expose().to_owned(),
         },
         store,
-    ));
-    if let Some(seed) = &config.seed_refresh_token {
-        tokens.seed_refresh_token(seed.expose()).await?;
-    }
+        config.seed_refresh_token.as_ref().map(Secret::expose),
+    )?);
     // Say at startup whether there is a credential at all. Without this the
     // first symptom of an unseeded server is a tool call failing, which reads
     // as a Withings problem rather than a configuration one.
@@ -421,42 +419,39 @@ mod tests {
         })
     }
 
-    async fn build(config: &Config) -> Router {
-        build_with_store(config, Box::new(MemoryStore::new()), Some("seed")).await
+    fn build(config: &Config) -> Router {
+        build_with_store(config, Box::new(MemoryStore::new()), Some("seed"))
     }
 
-    async fn build_with_store(
-        config: &Config,
-        store: Box<dyn TokenStore>,
-        seed: Option<&str>,
-    ) -> Router {
+    fn build_with_store(config: &Config, store: Box<dyn TokenStore>, seed: Option<&str>) -> Router {
         let withings = WithingsClient::new(&config.api_base_url).unwrap();
-        let tokens = Arc::new(TokenManager::new(
-            withings.clone(),
-            ClientCredentials {
-                client_id: config.client_id.clone(),
-                client_secret: config.client_secret.expose().to_owned(),
-            },
-            store,
-        ));
-        if let Some(seed) = seed {
-            tokens.seed_refresh_token(seed).await.unwrap();
-        }
+        let tokens = Arc::new(
+            TokenManager::new(
+                withings.clone(),
+                ClientCredentials {
+                    client_id: config.client_id.clone(),
+                    client_secret: config.client_secret.expose().to_owned(),
+                },
+                store,
+                seed,
+            )
+            .unwrap(),
+        );
         let limiter = Arc::new(Limiter::new(100_000).unwrap());
         build_router(config, withings, tokens, &limiter)
     }
 
-    async fn router(api_base_url: &str) -> Router {
-        build(&test_config(api_base_url)).await
+    fn router(api_base_url: &str) -> Router {
+        build(&test_config(api_base_url))
     }
 
     /// A router whose `allowed_hosts` came from configuration rather than the
     /// loopback default, the way the environment variable supplies it in a
     /// deployment.
-    async fn router_with_hosts(api_base_url: &str, hosts: &[&str]) -> Router {
+    fn router_with_hosts(api_base_url: &str, hosts: &[&str]) -> Router {
         let mut config = test_config(api_base_url);
         config.allowed_hosts = hosts.iter().map(|host| (*host).to_owned()).collect();
-        build(&config).await
+        build(&config)
     }
 
     async fn initialize_with_host(app: Router, host: &str) -> StatusCode {
@@ -489,7 +484,7 @@ mod tests {
             (ORIGIN, true),
             ("evil.example", true),
         ] {
-            let status = initialize_with_host(router("https://example.test").await, host).await;
+            let status = initialize_with_host(router("https://example.test"), host).await;
             assert_eq!(
                 status == StatusCode::FORBIDDEN,
                 rejected,
@@ -500,18 +495,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_configured_public_host_is_accepted() {
-        let status = initialize_with_host(
-            router_with_hosts("https://example.test", &[ORIGIN]).await,
-            ORIGIN,
-        )
-        .await;
+        let status =
+            initialize_with_host(router_with_hosts("https://example.test", &[ORIGIN]), ORIGIN)
+                .await;
         assert_ne!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn health_is_public_without_a_bearer() {
         let response = router("https://example.test")
-            .await
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -527,7 +519,6 @@ mod tests {
     #[tokio::test]
     async fn mcp_without_a_bearer_returns_a_bare_401() {
         let response = router("https://example.test")
-            .await
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -555,7 +546,6 @@ mod tests {
             "Basic aW5ib3VuZC1zZWNyZXQ=",
         ] {
             let response = router("https://example.test")
-                .await
                 .oneshot(
                     Request::builder()
                         .method("POST")
@@ -586,7 +576,6 @@ mod tests {
             "/no-such-path",
         ] {
             let response = router("https://example.test")
-                .await
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
@@ -668,7 +657,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let app = router_with_hosts(&server.uri(), &[ORIGIN]).await;
+        let app = router_with_hosts(&server.uri(), &[ORIGIN]);
         let envelope = tool_call_envelope(app, "latest_measurements", "{}").await;
         let content = &envelope["result"]["structuredContent"];
         let measurements = content["measurements"].as_array().unwrap();
@@ -704,7 +693,7 @@ mod tests {
             .mount(&throttling)
             .await;
         let envelope = tool_call_envelope(
-            router_with_hosts(&throttling.uri(), &[ORIGIN]).await,
+            router_with_hosts(&throttling.uri(), &[ORIGIN]),
             "list_measurements",
             "{}",
         )
@@ -732,7 +721,7 @@ mod tests {
             .mount(&empty)
             .await;
         let envelope = tool_call_envelope(
-            router_with_hosts(&empty.uri(), &[ORIGIN]).await,
+            router_with_hosts(&empty.uri(), &[ORIGIN]),
             "list_measurements",
             "{}",
         )
@@ -752,12 +741,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": 250})))
             .mount(&server)
             .await;
-        let envelope = tool_call_envelope(
-            router_with_hosts(&server.uri(), &[ORIGIN]).await,
-            "whoami",
-            "{}",
-        )
-        .await;
+        let envelope =
+            tool_call_envelope(router_with_hosts(&server.uri(), &[ORIGIN]), "whoami", "{}").await;
         assert_eq!(envelope["error"]["data"]["code"], "withings_invalid_grant");
         assert!(
             envelope["error"]["message"]
@@ -780,7 +765,7 @@ mod tests {
             .mount(&server)
             .await;
         let envelope = tool_call_envelope(
-            router_with_hosts(&server.uri(), &[ORIGIN]).await,
+            router_with_hosts(&server.uri(), &[ORIGIN]),
             "measurement_types",
             "{}",
         )
@@ -801,7 +786,7 @@ mod tests {
     /// rather than mislabelling a tool.
     #[tokio::test]
     async fn every_tool_is_annotated_read_only_and_none_writes() {
-        let app = router_with_hosts("https://example.test", &[ORIGIN]).await;
+        let app = router_with_hosts("https://example.test", &[ORIGIN]);
         let initialize = app
             .clone()
             .oneshot(
@@ -872,7 +857,6 @@ mod tests {
     #[tokio::test]
     async fn the_oauth_callback_is_off_unless_a_state_value_is_configured() {
         let response = router("https://example.test")
-            .await
             .oneshot(
                 Request::builder()
                     .uri("/oauth/callback?code=abc&state=anything")
@@ -899,7 +883,7 @@ mod tests {
         let mut config = test_config(&server.uri());
         config.oauth_state = Some(Secret::new("expected-state"));
         config.redirect_uri = Some("https://example.test/oauth/callback".to_owned());
-        let app = build(&config).await;
+        let app = build(&config);
         for query in [
             "?code=abc&state=wrong",
             "?code=abc",
@@ -936,14 +920,18 @@ mod tests {
         config.redirect_uri = Some("https://example.test/oauth/callback".to_owned());
 
         let withings = WithingsClient::new(&config.api_base_url).unwrap();
-        let tokens = Arc::new(TokenManager::new(
-            withings.clone(),
-            ClientCredentials {
-                client_id: config.client_id.clone(),
-                client_secret: config.client_secret.expose().to_owned(),
-            },
-            Box::new(MemoryStore::new()),
-        ));
+        let tokens = Arc::new(
+            TokenManager::new(
+                withings.clone(),
+                ClientCredentials {
+                    client_id: config.client_id.clone(),
+                    client_secret: config.client_secret.expose().to_owned(),
+                },
+                Box::new(MemoryStore::new()),
+                None,
+            )
+            .unwrap(),
+        );
         let app = build_router(
             &config,
             withings,

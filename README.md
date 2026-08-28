@@ -36,7 +36,8 @@ access token is used, whichever comes first.
 
 So `WITHINGS_MCP_REFRESH_TOKEN` is a *seed* rather than a standing credential.
 It is used only when the token store holds nothing, because the stored value is
-newer by construction. A deployment that sets no `WITHINGS_MCP_TOKEN_STATE_PATH`
+newer by construction, and it is applied while the manager is being built
+rather than by a method anything could call later. A deployment that sets no `WITHINGS_MCP_TOKEN_STATE_PATH`
 keeps the rotated token in memory, authenticates once per restart, and then
 cannot — so it logs a warning at startup saying exactly that.
 
