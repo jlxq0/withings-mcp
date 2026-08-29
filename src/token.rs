@@ -196,17 +196,36 @@ impl TokenStore for FileStore {
 
 /// Holds the current tokens and refreshes them when they go stale.
 ///
-/// One `Mutex` serialises refreshes, so N concurrent tool calls arriving on an
-/// expired token produce one refresh rather than N. That matters more here
-/// than it would elsewhere: N concurrent refreshes would rotate the token N
-/// times and only the last result would be persisted, leaving the store
-/// holding a value Withings has already superseded.
+/// **One `Mutex` serialises every mutation reachable after construction**:
+/// [`Self::adopt`] and the whole refresh-persist-read-back-return sequence both
+/// take it. Serialising refreshes alone is not enough, and the gap is not
+/// obvious: a callback adopting a new authorisation between a refresh's
+/// read-back and its return leaves the store holding a token that does not
+/// match the access token just handed out, so the guarantee
+/// `persist_before_use` exists to make stops being atomic. Found in
+/// cross-engine review of this file, 2026-08-29.
+///
+/// Seeding is the third mutation and it is **not** behind the gate, because it
+/// happens in [`seed`] before the manager exists and therefore before anything
+/// can share it. That is why it is a constructor argument rather than a
+/// method: a gate whose necessity depends on an ordering nothing asserts is a
+/// gate a reader cannot evaluate.
+///
+/// What the serialisation buys: N concurrent tool calls arriving on an expired
+/// token produce one refresh rather than N. N concurrent refreshes would rotate
+/// the token N times and persist only the last, leaving the store holding a
+/// value Withings has already superseded — the same silent death as no
+/// write-back at all, reachable without a restart.
+///
+/// **The gate is per manager, so one store must not be shared by two.** Two
+/// managers over one store have two mutexes and none of this holds. There is
+/// one manager per process here and nothing enforces that in the type.
 pub struct TokenManager {
     client: WithingsClient,
     credentials: ClientCredentials,
     store: Box<dyn TokenStore>,
     refresh_skew: Duration,
-    refresh_gate: Mutex<()>,
+    store_gate: Mutex<()>,
 }
 
 impl fmt::Debug for TokenManager {
@@ -218,54 +237,73 @@ impl fmt::Debug for TokenManager {
     }
 }
 
+/// Write the configured seed into an empty store.
+///
+/// Taken as a constructor argument rather than a method on purpose. The seed
+/// is applied to a store that has not yet been handed to a [`TokenManager`],
+/// so nothing else can hold a reference to it and there is no ordering for a
+/// later edit to get wrong. The previous shape was a public `seed_refresh_token`
+/// whose safety rested on `main` calling it before the listener bound —
+/// unasserted, and removing its lock reddened no test. Cross-engine review of
+/// the gate, 2026-08-29.
+///
+/// A seed never overwrites a stored value: the stored one is newer by
+/// construction, and preferring the environment would hand Withings a refresh
+/// token it retired at the previous rotation.
+fn seed(store: &dyn TokenStore, refresh_token: Option<&str>) -> Result<()> {
+    let Some(refresh_token) = refresh_token else {
+        return Ok(());
+    };
+    if store.load()?.is_some() {
+        info!("token store already holds tokens; configured seed not used");
+        return Ok(());
+    }
+    store.save(&StoredTokens {
+        userid: String::new(),
+        access_token: String::new(),
+        refresh_token: refresh_token.to_owned(),
+        scope: String::new(),
+        // Zero is in the past, so the first call refreshes. There is no
+        // access token to go with a seed.
+        expires_at: 0,
+    })
+}
+
 impl TokenManager {
-    /// Build a manager with [`DEFAULT_REFRESH_SKEW`].
+    /// Build a manager with [`DEFAULT_REFRESH_SKEW`], seeding the store if a
+    /// seed was configured and the store holds nothing.
     ///
     /// This is the constructor `main` calls, so it is the one whose behaviour
     /// a deployment actually gets.
-    #[must_use]
     pub fn new(
         client: WithingsClient,
         credentials: ClientCredentials,
         store: Box<dyn TokenStore>,
-    ) -> Self {
-        Self::with_refresh_skew(client, credentials, store, DEFAULT_REFRESH_SKEW)
+        seed_refresh_token: Option<&str>,
+    ) -> Result<Self> {
+        Self::with_refresh_skew(
+            client,
+            credentials,
+            store,
+            seed_refresh_token,
+            DEFAULT_REFRESH_SKEW,
+        )
     }
 
-    #[must_use]
     pub fn with_refresh_skew(
         client: WithingsClient,
         credentials: ClientCredentials,
         store: Box<dyn TokenStore>,
+        seed_refresh_token: Option<&str>,
         refresh_skew: Duration,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        seed(store.as_ref(), seed_refresh_token)?;
+        Ok(Self {
             client,
             credentials,
             store,
             refresh_skew,
-            refresh_gate: Mutex::new(()),
-        }
-    }
-
-    /// Seed the store from configuration if it holds nothing yet.
-    ///
-    /// A seed never overwrites a stored value: the stored one is newer by
-    /// construction, and preferring the environment would hand Withings a
-    /// refresh token it retired at the previous rotation.
-    pub fn seed_refresh_token(&self, refresh_token: &str) -> Result<()> {
-        if self.store.load()?.is_some() {
-            info!("token store already holds tokens; configured seed not used");
-            return Ok(());
-        }
-        self.store.save(&StoredTokens {
-            userid: String::new(),
-            access_token: String::new(),
-            refresh_token: refresh_token.to_owned(),
-            scope: String::new(),
-            // Zero is in the past, so the first call refreshes. There is no
-            // access token to go with a seed.
-            expires_at: 0,
+            store_gate: Mutex::new(()),
         })
     }
 
@@ -273,7 +311,8 @@ impl TokenManager {
     ///
     /// Used by the OAuth callback, which is the one path that legitimately
     /// discards an existing credential.
-    pub fn adopt(&self, response: &TokenResponse) -> Result<StoredTokens> {
+    pub async fn adopt(&self, response: &TokenResponse) -> Result<StoredTokens> {
+        let _guard = self.store_gate.lock().await;
         let tokens = StoredTokens::from_response(response, now_unix());
         self.store.save(&tokens)?;
         Ok(tokens)
@@ -290,7 +329,7 @@ impl TokenManager {
         if stored.is_fresh(now_unix(), self.refresh_skew) {
             return Ok(stored);
         }
-        let _guard = self.refresh_gate.lock().await;
+        let _guard = self.store_gate.lock().await;
         // Re-read under the gate: another task may have refreshed while this
         // one waited, and refreshing again would rotate a token that is
         // already current.
@@ -326,10 +365,10 @@ impl TokenManager {
     /// The caller sees an error, the tool call fails loudly, and the old
     /// refresh token is still alive.
     ///
-    /// This and [`Self::refresh_gate`] defend the same thing from two sides —
-    /// the gate stops a concurrent refresh superseding the value being stored,
-    /// this stops a stored value being skipped altogether. Neither makes the
-    /// other redundant.
+    /// This and the store gate defend the same thing from two sides — the gate
+    /// stops a concurrent mutation superseding the value being stored, this
+    /// stops a stored value being skipped altogether. Neither makes the other
+    /// redundant.
     fn persist_before_use(&self, refreshed: &StoredTokens) -> Result<(), WithingsError> {
         if let Err(error) = self.store.save(refreshed) {
             warn!(%error, "refreshed tokens could not be persisted; not using the new access token");
@@ -413,7 +452,9 @@ mod tests {
             WithingsClient::new("https://example.test").unwrap(),
             credentials(),
             Box::new(MemoryStore::new()),
-        );
+            None,
+        )
+        .unwrap();
         assert_eq!(manager.refresh_skew, DEFAULT_REFRESH_SKEW);
         assert_eq!(DEFAULT_REFRESH_SKEW, Duration::from_mins(5));
         // Non-zero is the property that matters: at zero, a token is fresh
@@ -451,13 +492,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let store = Box::new(MemoryStore::new());
         let manager = TokenManager::new(
             WithingsClient::new(&server.uri()).unwrap(),
             credentials(),
-            store,
-        );
-        manager.seed_refresh_token("seed").unwrap();
+            Box::new(MemoryStore::new()),
+            Some("seed"),
+        )
+        .unwrap();
 
         let tokens = manager.access_token().await.unwrap();
         assert_eq!(tokens.access_token, "acc-1");
@@ -484,8 +525,9 @@ mod tests {
             WithingsClient::new(&server.uri()).unwrap(),
             credentials(),
             Box::new(MemoryStore::new()),
-        );
-        manager.seed_refresh_token("seed").unwrap();
+            Some("seed"),
+        )
+        .unwrap();
         manager.access_token().await.unwrap();
         // Second call is inside the three-hour window: `expect(1)` above is
         // what fails if this one refreshes again.
@@ -559,8 +601,9 @@ mod tests {
             WithingsClient::new(&server.uri()).unwrap(),
             credentials(),
             store,
-        );
-        manager.seed_refresh_token("seed").unwrap();
+            Some("seed"),
+        )
+        .unwrap();
         manager.access_token().await
     }
 
@@ -592,6 +635,112 @@ mod tests {
         assert!(format!("{error}").contains("persist"), "{error}");
     }
 
+    /// A handle onto a shared [`RecordingStore`], so the test can read the
+    /// write order after handing ownership to the manager.
+    struct Shared(std::sync::Arc<RecordingStore>);
+
+    impl fmt::Debug for Shared {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("Shared")
+        }
+    }
+
+    impl TokenStore for Shared {
+        fn load(&self) -> Result<Option<StoredTokens>> {
+            self.0.load()
+        }
+
+        fn save(&self, tokens: &StoredTokens) -> Result<()> {
+            self.0.save(tokens)
+        }
+    }
+
+    /// Records the refresh token of every write, in order.
+    #[derive(Debug, Default)]
+    struct RecordingStore {
+        tokens: RwLock<Option<StoredTokens>>,
+        writes: RwLock<Vec<String>>,
+    }
+
+    impl TokenStore for RecordingStore {
+        fn load(&self) -> Result<Option<StoredTokens>> {
+            Ok(self.tokens.read().unwrap().clone())
+        }
+
+        fn save(&self, tokens: &StoredTokens) -> Result<()> {
+            self.writes
+                .write()
+                .unwrap()
+                .push(tokens.refresh_token.clone());
+            *self.tokens.write().unwrap() = Some(tokens.clone());
+            Ok(())
+        }
+    }
+
+    /// `adopt` must not mutate the store while a refresh is in flight.
+    ///
+    /// Serialising refreshes alone leaves this open: a callback adopting a new
+    /// authorisation between a refresh's read-back and its return leaves the
+    /// store holding a token that does not match the access token just handed
+    /// out, so the atomicity `persist_before_use` exists to provide is gone.
+    /// Found in cross-engine review, 2026-08-29.
+    ///
+    /// The refresh is delayed 300 ms and the adopt is issued 50 ms in. Under
+    /// the gate the writes are ordered refresh-then-adopt; with `adopt` outside
+    /// it, the adopt write lands first, in the middle of the refresh.
+    #[tokio::test]
+    async fn an_adopt_cannot_interleave_with_a_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(token_response("acc-1", "rot-1"))
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let manager = std::sync::Arc::new(
+            TokenManager::new(
+                WithingsClient::new(&server.uri()).unwrap(),
+                credentials(),
+                Box::new(Shared(std::sync::Arc::clone(&store))),
+                Some("seed"),
+            )
+            .unwrap(),
+        );
+
+        let refreshing = tokio::spawn({
+            let manager = std::sync::Arc::clone(&manager);
+            async move { manager.access_token().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        manager
+            .adopt(&TokenResponse {
+                userid: "1234567".to_owned(),
+                access_token: "acc-adopted".to_owned(),
+                refresh_token: "rot-adopted".to_owned(),
+                scope: "user.metrics".to_owned(),
+                expires_in: 10_800,
+            })
+            .await
+            .unwrap();
+        refreshing.await.unwrap().unwrap();
+
+        let writes = store.writes.read().unwrap().clone();
+        assert_eq!(
+            writes,
+            vec![
+                "seed".to_owned(),
+                "rot-1".to_owned(),
+                "rot-adopted".to_owned()
+            ],
+            "the adopt wrote while the refresh was in flight"
+        );
+    }
+
     #[tokio::test]
     async fn a_seed_never_overwrites_a_stored_rotation() {
         let store = MemoryStore::new();
@@ -608,8 +757,9 @@ mod tests {
             WithingsClient::new("https://example.test").unwrap(),
             credentials(),
             Box::new(store),
-        );
-        manager.seed_refresh_token("stale-seed").unwrap();
+            Some("stale-seed"),
+        )
+        .unwrap();
         assert_eq!(manager.peek().unwrap().unwrap().refresh_token, "rotated");
     }
 
@@ -619,7 +769,9 @@ mod tests {
             WithingsClient::new("https://example.test").unwrap(),
             credentials(),
             Box::new(MemoryStore::new()),
-        );
+            None,
+        )
+        .unwrap();
         let error = manager.access_token().await.unwrap_err();
         assert_eq!(error.code(), "withings_invalid_grant");
     }

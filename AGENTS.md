@@ -122,6 +122,47 @@ Required regression coverage:
   no write-back, reachable without a restart. Do not remove either on the
   grounds that the other exists.
 
+- **The store has three mutations. Two are behind the gate and pinned; the
+  third happens before the manager exists.** `adopt` and the whole
+  refresh-persist-read-back-return sequence take `store_gate`, and removing it
+  from either reds `an_adopt_cannot_interleave_with_a_refresh`, measured
+  2026-08-29: 72 passed, 1 failed each time.
+
+  The hole a refresh-only gate leaves is not obvious, which is why it survived
+  the first version: `/oauth/callback` adopting a new authorisation between a
+  refresh's read-back and its return leaves the store holding a token that does
+  not match the access token just handed out, so the atomicity
+  `persist_before_use` exists to provide is gone while every individual step
+  looks correct. Found in cross-engine review of `token.rs` by asking one
+  specific question about the new code rather than for a review of it.
+
+  `an_adopt_cannot_interleave_with_a_refresh` pins write **order** rather than
+  outcome, which is the right instrument for a race: the refresh is delayed
+  300 ms, the adopt is issued 50 ms in, and the recorded order must be seed,
+  refresh, adopt.
+
+- **Seeding is a constructor argument rather than a method, and that is the
+  fix rather than the style.** It was `pub async fn seed_refresh_token`, taking
+  the gate, and **removing that lock reddened nothing** — a peer measured it,
+  73 passed, 0 failed. The lock was not load-bearing: what made the race
+  unreachable was `main` seeding before the listener bound, an ordering nothing
+  asserted and any later edit could move.
+
+  A gate whose necessity rests on an unasserted ordering is a gate a reader
+  cannot evaluate. `seed` now runs inside `with_refresh_skew`, against a store
+  that has not yet been handed to a `TokenManager`, so nothing can share it and
+  there is no ordering to get wrong. **Do not reintroduce a public seeding
+  method.**
+
+  A seed never overwrites a stored value: the stored one is newer by
+  construction, and preferring the environment hands Withings a token it
+  retired at the previous rotation. **Deleting that check reds
+  `a_seed_never_overwrites_a_stored_rotation`**, measured 2026-08-29.
+
+- **The gate is per manager, so one `TokenStore` must not be shared by two.**
+  Two managers over one store have two mutexes and none of the above holds.
+  There is one manager per process and nothing in the type enforces it.
+
 - **Withings answers HTTP 200 for application errors.** The real outcome is in
   the body's `status` field, so a check on the HTTP status alone reports
   success for an expired token. `read_envelope` is the only place either layer

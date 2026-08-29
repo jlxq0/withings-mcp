@@ -107,10 +107,8 @@ fn build_app(config: &Config) -> Result<Router> {
             client_secret: config.client_secret.expose().to_owned(),
         },
         store,
-    ));
-    if let Some(seed) = &config.seed_refresh_token {
-        tokens.seed_refresh_token(seed.expose())?;
-    }
+        config.seed_refresh_token.as_ref().map(Secret::expose),
+    )?);
     // Say at startup whether there is a credential at all. Without this the
     // first symptom of an unseeded server is a tool call failing, which reads
     // as a Withings problem rather than a configuration one.
@@ -275,7 +273,7 @@ async fn oauth_callback(
                 .into_response()
         }
         Ok(response) => {
-            if let Err(error) = state.tokens.adopt(&response) {
+            if let Err(error) = state.tokens.adopt(&response).await {
                 warn!(%error, "oauth callback could not persist the new tokens");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -427,17 +425,18 @@ mod tests {
 
     fn build_with_store(config: &Config, store: Box<dyn TokenStore>, seed: Option<&str>) -> Router {
         let withings = WithingsClient::new(&config.api_base_url).unwrap();
-        let tokens = Arc::new(TokenManager::new(
-            withings.clone(),
-            ClientCredentials {
-                client_id: config.client_id.clone(),
-                client_secret: config.client_secret.expose().to_owned(),
-            },
-            store,
-        ));
-        if let Some(seed) = seed {
-            tokens.seed_refresh_token(seed).unwrap();
-        }
+        let tokens = Arc::new(
+            TokenManager::new(
+                withings.clone(),
+                ClientCredentials {
+                    client_id: config.client_id.clone(),
+                    client_secret: config.client_secret.expose().to_owned(),
+                },
+                store,
+                seed,
+            )
+            .unwrap(),
+        );
         let limiter = Arc::new(Limiter::new(100_000).unwrap());
         build_router(config, withings, tokens, &limiter)
     }
@@ -921,14 +920,18 @@ mod tests {
         config.redirect_uri = Some("https://example.test/oauth/callback".to_owned());
 
         let withings = WithingsClient::new(&config.api_base_url).unwrap();
-        let tokens = Arc::new(TokenManager::new(
-            withings.clone(),
-            ClientCredentials {
-                client_id: config.client_id.clone(),
-                client_secret: config.client_secret.expose().to_owned(),
-            },
-            Box::new(MemoryStore::new()),
-        ));
+        let tokens = Arc::new(
+            TokenManager::new(
+                withings.clone(),
+                ClientCredentials {
+                    client_id: config.client_id.clone(),
+                    client_secret: config.client_secret.expose().to_owned(),
+                },
+                Box::new(MemoryStore::new()),
+                None,
+            )
+            .unwrap(),
+        );
         let app = build_router(
             &config,
             withings,
