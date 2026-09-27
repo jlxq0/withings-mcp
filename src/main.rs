@@ -953,4 +953,282 @@ mod tests {
         assert_eq!(stored.userid, "1234567");
         server.verify().await;
     }
+
+    /// Captures every event on this thread as JSON lines.
+    ///
+    /// `#[tokio::test]` runs on one thread, so a thread-local default sees the
+    /// events rmcp's spawned session tasks emit too.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        /// The fields of every `Withings call failed` event.
+        fn failures(&self) -> Vec<serde_json::Value> {
+            self.text()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["fields"]["message"] == "Withings call failed")
+                .map(|event| event["fields"].clone())
+                .collect()
+        }
+    }
+
+    /// `test_config` with `ORIGIN` allowed, as `tool_call_envelope` sends it.
+    fn origin_config(api_base_url: &str) -> Config {
+        let mut config = test_config(api_base_url);
+        config.allowed_hosts = vec![ORIGIN.to_owned()];
+        config
+    }
+
+    /// Every credential and private value the failure tests hand the server.
+    /// None may reach a client or a log line. Invented values throughout.
+    const PRIVATE: &[&str] = &[
+        INBOUND,
+        "client-secret",
+        "seed-secret-value",
+        "acc-secret-value",
+        "rot-secret-value",
+        "invented-private-detail",
+        "1234567",
+    ];
+
+    fn assert_nothing_private(what: &str, text: &str) {
+        for private in PRIVATE {
+            assert!(
+                !text.contains(private),
+                "{what} carries {private:?}: {text}"
+            );
+        }
+    }
+
+    /// A refresh Withings refuses with an unmapped status names its stage and
+    /// its number, on the wire and in one log event, and carries nothing
+    /// private. `whoami` never calls `measure`, so it failing the same way as
+    /// a read is what isolates the refresh. The seed is still what the store
+    /// holds afterwards: nothing was persisted.
+    ///
+    /// `503` is Withings' documented "invalid params" status. Which refresh
+    /// input it objects to is not something this server can see.
+    #[tokio::test]
+    async fn a_refresh_failure_names_its_stage_and_status_and_nothing_private() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"status": 503, "error": "invented-private-detail 1234567"}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/measure"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(measure_body()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+
+        let captured = Captured::default();
+        let _guard = captured.install();
+        for tool in ["whoami", "latest_measurements"] {
+            let app = build_with_store(
+                &origin_config(&server.uri()),
+                Box::new(FileStore::new(&state)),
+                Some("seed-secret-value"),
+            );
+            let envelope = tool_call_envelope(app, tool, "{}").await;
+            let data = &envelope["error"]["data"];
+            assert_eq!(data["code"], "withings_api_error", "{tool}: {envelope}");
+            assert_eq!(data["class"], "internal", "{tool}: {envelope}");
+            assert_eq!(data["stage"], "refresh", "{tool}: {envelope}");
+            assert_eq!(data["withings_status"], 503, "{tool}: {envelope}");
+            assert_nothing_private(tool, &envelope.to_string());
+        }
+        let failures = captured.failures();
+        assert_eq!(failures.len(), 2, "{}", captured.text());
+        for fields in &failures {
+            assert_eq!(fields["stage"], "refresh", "{fields}");
+            assert_eq!(fields["withings_status"], 503, "{fields}");
+            assert_eq!(fields["code"], "withings_api_error", "{fields}");
+        }
+        assert_nothing_private("the log", &captured.text());
+
+        let stored = FileStore::new(&state).load().unwrap().unwrap();
+        assert_eq!(stored.refresh_token, "seed-secret-value");
+        assert_eq!(stored.expires_at, 0);
+        server.verify().await;
+    }
+
+    /// The same status from `measure`, after a refresh in Withings'
+    /// documented shape succeeded, names the other stage.
+    #[tokio::test]
+    async fn a_measure_failure_names_its_stage_and_status_and_nothing_private() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": 0,
+                "body": {
+                    "access_token": "acc-secret-value",
+                    "refresh_token": "rot-secret-value",
+                    "expires_in": 10800
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/measure"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 503, "error": "invented-private-detail"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let captured = Captured::default();
+        let _guard = captured.install();
+        let app = build_with_store(
+            &origin_config(&server.uri()),
+            Box::new(MemoryStore::new()),
+            Some("seed-secret-value"),
+        );
+        let envelope = tool_call_envelope(app, "list_measurements", "{}").await;
+        let data = &envelope["error"]["data"];
+        assert_eq!(data["stage"], "measure", "{envelope}");
+        assert_eq!(data["withings_status"], 503, "{envelope}");
+        assert_nothing_private("the envelope", &envelope.to_string());
+        let failures = captured.failures();
+        assert_eq!(failures.len(), 1, "{}", captured.text());
+        assert_eq!(failures[0]["stage"], "measure");
+        assert_eq!(failures[0]["withings_status"], 503);
+        assert_nothing_private("the log", &captured.text());
+        server.verify().await;
+    }
+
+    /// `whoami` keeps reporting the account after a refresh in Withings'
+    /// documented shape, which carries no `userid` or `scope`: both come
+    /// forward from the stored record, and `userid` stays a string.
+    #[tokio::test]
+    async fn whoami_keeps_the_account_across_a_refresh_that_omits_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .and(body_string_contains("refresh_token=rot-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": 0,
+                "body": {"access_token": "acc-1", "refresh_token": "rot-1", "expires_in": 10800}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = MemoryStore::new();
+        store
+            .save(&crate::token::StoredTokens {
+                userid: "1234567".to_owned(),
+                access_token: "acc-0".to_owned(),
+                refresh_token: "rot-0".to_owned(),
+                scope: "user.metrics".to_owned(),
+                expires_at: 0,
+            })
+            .unwrap();
+        let app = build_with_store(&origin_config(&server.uri()), Box::new(store), None);
+        let envelope = tool_call_envelope(app, "whoami", "{}").await;
+        let content = &envelope["result"]["structuredContent"];
+        assert_eq!(content["userid"], "1234567", "{envelope}");
+        assert_eq!(content["scope"], "user.metrics", "{envelope}");
+        server.verify().await;
+    }
+
+    /// A consent whose response does not name the account is refused and the
+    /// stored credential is left alone. Only a refresh inherits identity.
+    #[tokio::test]
+    async fn the_oauth_callback_refuses_an_authorisation_without_a_userid() {
+        let server = MockServer::start().await;
+        let mut body = token_body("acc-9", "rot-9");
+        body["body"].as_object_mut().unwrap().remove("userid");
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = test_config(&server.uri());
+        config.oauth_state = Some(Secret::new("expected-state"));
+        config.redirect_uri = Some("https://example.test/oauth/callback".to_owned());
+
+        let store = MemoryStore::new();
+        let existing = crate::token::StoredTokens {
+            userid: "7654321".to_owned(),
+            access_token: "acc-0".to_owned(),
+            refresh_token: "rot-0".to_owned(),
+            scope: "user.metrics".to_owned(),
+            expires_at: 0,
+        };
+        store.save(&existing).unwrap();
+        let withings = WithingsClient::new(&config.api_base_url).unwrap();
+        let tokens = Arc::new(
+            TokenManager::new(
+                withings.clone(),
+                ClientCredentials {
+                    client_id: config.client_id.clone(),
+                    client_secret: config.client_secret.expose().to_owned(),
+                },
+                Box::new(store),
+                None,
+            )
+            .unwrap(),
+        );
+        let app = build_router(
+            &config,
+            withings,
+            Arc::clone(&tokens),
+            &Arc::new(Limiter::new(100).unwrap()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/callback?code=fresh-code&state=expected-state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        let text = String::from_utf8_lossy(&to_bytes(response.into_body(), 4096).await.unwrap())
+            .into_owned();
+        assert!(!text.contains("rot-9"), "{text}");
+        assert_eq!(tokens.peek().unwrap().unwrap(), existing);
+        server.verify().await;
+    }
 }

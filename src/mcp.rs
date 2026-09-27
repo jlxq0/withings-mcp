@@ -98,10 +98,10 @@ impl WithingsMcpService {
                 .tokens
                 .access_token()
                 .await
-                .map_err(map_withings_error)?;
+                .map_err(|error| map_withings_error(Stage::Refresh, error))?;
             let value = call(tokens.access_token)
                 .await
-                .map_err(map_withings_error)?;
+                .map_err(|error| map_withings_error(Stage::Measure, error))?;
             Ok(structured_result(&value))
         }
         .instrument(span.clone())
@@ -152,8 +152,57 @@ fn structured_error(code: i32, condition: &str, message: &str) -> ErrorData {
     )
 }
 
-fn map_withings_error(error: WithingsError) -> ErrorData {
-    match error {
+/// Which Withings call a failure came from.
+///
+/// `Refresh` is everything behind [`TokenManager::access_token`]: reading the
+/// store, the `requesttoken` call when the access token is spent, and the
+/// persist-and-read-back. `Measure` is the `getmeas` call after a token was in
+/// hand. `whoami` never reaches `Measure`, so a `whoami` failing the same way
+/// as a read isolates the refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Refresh,
+    Measure,
+}
+
+impl Stage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refresh => "refresh",
+            Self::Measure => "measure",
+        }
+    }
+}
+
+/// Map a Withings failure to the error a caller sees, with a diagnostic.
+///
+/// `data` always carries `stage`, and carries the numeric `withings_status`
+/// (body `status`) or `http_status` when Withings answered with one. Without
+/// them every unmapped status reads as the same `withings_api_error`, and
+/// `503` during a refresh cannot be told from `503` during a read. The same
+/// fields go to one `warn` event.
+///
+/// Only the stage, the stable code string and the numbers leave this
+/// function: never the error's `Display` (a transport error's source can name
+/// the URL), a response body, a token or a user id.
+fn map_withings_error(stage: Stage, error: WithingsError) -> ErrorData {
+    let code = error.code();
+    let withings_status = match error {
+        WithingsError::Api { status } => Some(status),
+        _ => None,
+    };
+    let http_status = match error {
+        WithingsError::Upstream { status } => Some(status),
+        _ => None,
+    };
+    tracing::warn!(
+        stage = stage.as_str(),
+        code,
+        withings_status,
+        http_status,
+        "Withings call failed"
+    );
+    let mut mapped = match error {
         WithingsError::Unauthorized => structured_error(
             WITHINGS_NOT_AUTHORIZED_CODE,
             "withings_not_authorized",
@@ -170,8 +219,29 @@ fn map_withings_error(error: WithingsError) -> ErrorData {
             "Withings is rate limiting this client; try again in a minute",
         ),
         WithingsError::InvalidInput(message) => ErrorData::invalid_params(message, None),
+        WithingsError::Api { status } => ErrorData::internal_error(
+            format!(
+                "{code}: Withings returned status {status} during {}",
+                stage.as_str()
+            ),
+            None,
+        ),
         other => ErrorData::internal_error(other.code(), None),
+    };
+    let class = audit::error_class(&mapped);
+    let data = mapped
+        .data
+        .get_or_insert_with(|| json!({ "code": code, "class": class }));
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert("stage".to_owned(), json!(stage.as_str()));
+        if let Some(status) = withings_status {
+            fields.insert("withings_status".to_owned(), json!(status));
+        }
+        if let Some(status) = http_status {
+            fields.insert("http_status".to_owned(), json!(status));
+        }
     }
+    mapped
 }
 
 fn make_tool_span(tool: &'static str, token_hash: &str, resource: Option<&str>) -> Span {
@@ -303,7 +373,7 @@ impl WithingsMcpService {
                 .tokens
                 .access_token()
                 .await
-                .map_err(map_withings_error)?;
+                .map_err(|error| map_withings_error(Stage::Refresh, error))?;
             let now = now_unix();
             Ok(structured_result(&json!({
                 "userid": tokens.userid,
@@ -542,7 +612,7 @@ mod tests {
     #[test]
     fn both_rate_limits_reach_a_caller_as_one_class() {
         let ours = structured_error(audit::RATE_LIMITED_CODE, "rate_limited", "slow down");
-        let theirs = map_withings_error(WithingsError::RateLimited);
+        let theirs = map_withings_error(Stage::Measure, WithingsError::RateLimited);
         for error in [&ours, &theirs] {
             let data = error.data.as_ref().unwrap();
             assert_eq!(data["class"], "rate_limited", "{error:?}");
@@ -553,7 +623,7 @@ mod tests {
 
     #[test]
     fn an_expired_authorisation_says_so_rather_than_reading_as_internal() {
-        let error = map_withings_error(WithingsError::InvalidGrant);
+        let error = map_withings_error(Stage::Refresh, WithingsError::InvalidGrant);
         let data = error.data.as_ref().unwrap();
         assert_eq!(data["code"], "withings_invalid_grant");
         assert!(

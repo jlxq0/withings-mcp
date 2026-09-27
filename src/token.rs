@@ -67,12 +67,38 @@ impl fmt::Debug for StoredTokens {
 }
 
 impl StoredTokens {
-    fn from_response(response: &TokenResponse, now: u64) -> Self {
+    /// A new authorisation. It replaces an account rather than continuing
+    /// one, so nothing is inherited. Only reached through [`TokenManager::adopt`],
+    /// which has already refused a response without `userid` and `scope`.
+    fn from_authorization(response: &TokenResponse, now: u64) -> Self {
         Self {
-            userid: response.userid.clone(),
+            userid: response.userid.clone().unwrap_or_default(),
             access_token: response.access_token.clone(),
             refresh_token: response.refresh_token.clone(),
-            scope: response.scope.clone(),
+            scope: response.scope.clone().unwrap_or_default(),
+            expires_at: now.saturating_add(response.expires_in),
+        }
+    }
+
+    /// The record a refresh of `previous` produces.
+    ///
+    /// Withings' documented refresh response carries only the token pair and
+    /// `expires_in`, so `userid` and `scope` are this account's, carried
+    /// forward. A refresh continues the same authorisation, so the stored
+    /// values are still true; dropping them would turn `whoami` blank after
+    /// the first refresh. A value the response does carry wins.
+    fn from_refresh(response: &TokenResponse, previous: &Self, now: u64) -> Self {
+        Self {
+            userid: response
+                .userid
+                .clone()
+                .unwrap_or_else(|| previous.userid.clone()),
+            access_token: response.access_token.clone(),
+            refresh_token: response.refresh_token.clone(),
+            scope: response
+                .scope
+                .clone()
+                .unwrap_or_else(|| previous.scope.clone()),
             expires_at: now.saturating_add(response.expires_in),
         }
     }
@@ -311,9 +337,18 @@ impl TokenManager {
     ///
     /// Used by the OAuth callback, which is the one path that legitimately
     /// discards an existing credential.
+    ///
+    /// Fails closed, before touching the store, on a response without a
+    /// `userid` and `scope`. `exchange_code` already refuses one; this is
+    /// checked again here because this is where the credential is replaced,
+    /// and a record with no identity is one a later refresh would carry
+    /// forward blank indefinitely.
     pub async fn adopt(&self, response: &TokenResponse) -> Result<StoredTokens> {
+        response
+            .require_identity()
+            .context("refusing to adopt an authorisation that does not name its account")?;
         let _guard = self.store_gate.lock().await;
-        let tokens = StoredTokens::from_response(response, now_unix());
+        let tokens = StoredTokens::from_authorization(response, now_unix());
         self.store.save(&tokens)?;
         Ok(tokens)
     }
@@ -341,10 +376,12 @@ impl TokenManager {
             .client
             .refresh(&self.credentials, &stored.refresh_token)
             .await?;
-        let refreshed = StoredTokens::from_response(&response, now_unix());
+        let refreshed = StoredTokens::from_refresh(&response, &stored, now_unix());
         self.persist_before_use(&refreshed)?;
+        // No userid: a Withings user id is account content, and this line is
+        // on the path whose logs `a_refresh_failure_names_its_stage_...` in
+        // `main.rs` holds to envelope fields only.
         info!(
-            userid = %refreshed.userid,
             expires_in = response.expires_in,
             "refreshed the Withings access token"
         );
@@ -380,11 +417,10 @@ impl TokenManager {
             warn!(%error, "refreshed tokens could not be read back");
             WithingsError::InvalidInput(format!("read back refreshed tokens: {error}"))
         })?;
-        if read_back
-            .as_ref()
-            .map(|tokens| tokens.refresh_token.as_str())
-            != Some(refreshed.refresh_token.as_str())
-        {
+        // The whole record, not only the refresh token: a store that kept the
+        // token but lost the carried-forward identity is half a state, and
+        // `whoami` would read it back blank.
+        if read_back.as_ref() != Some(refreshed) {
             warn!(
                 "token store did not read back the refreshed token; not using the new access token"
             );
@@ -506,6 +542,277 @@ mod tests {
         // refresh after a restart would send a token Withings has retired.
         let stored = manager.peek().unwrap().unwrap();
         assert_eq!(stored.refresh_token, "rot-1");
+        server.verify().await;
+    }
+
+    /// Withings' documented refresh response: the token pair and
+    /// `expires_in`, and nothing else.
+    fn documented_refresh_response(access: &str, refresh: &str) -> serde_json::Value {
+        json!({
+            "status": 0,
+            "body": {
+                "access_token": access,
+                "refresh_token": refresh,
+                "expires_in": 10800
+            }
+        })
+    }
+
+    /// A store holding an authorised account whose access token is spent, so
+    /// the next call is a forced refresh. Invented id.
+    fn expired_account() -> MemoryStore {
+        let store = MemoryStore::new();
+        store
+            .save(&StoredTokens {
+                userid: "1234567".to_owned(),
+                access_token: "acc-0".to_owned(),
+                refresh_token: "rot-0".to_owned(),
+                scope: "user.metrics".to_owned(),
+                expires_at: 0,
+            })
+            .unwrap();
+        store
+    }
+
+    /// Withings' documented refresh response has no `userid` and no `scope`.
+    /// A refresh continues the same authorisation, so both are carried forward
+    /// from the stored record; losing them would blank `whoami` after the
+    /// first refresh, and requiring them failed every refresh outright.
+    #[tokio::test]
+    async fn a_refresh_that_omits_identity_keeps_the_stored_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .and(body_string_contains("refresh_token=rot-0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(documented_refresh_response("acc-1", "rot-1")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let manager = TokenManager::new(
+            WithingsClient::new(&server.uri()).unwrap(),
+            credentials(),
+            Box::new(expired_account()),
+            None,
+        )
+        .unwrap();
+
+        let handed_out = manager.access_token().await.unwrap();
+        let stored = manager.peek().unwrap().unwrap();
+        assert_eq!(
+            handed_out, stored,
+            "handed-out tokens differ from the stored ones"
+        );
+        assert_eq!(stored.userid, "1234567");
+        assert_eq!(stored.scope, "user.metrics");
+        assert_eq!(stored.access_token, "acc-1");
+        assert_eq!(stored.refresh_token, "rot-1");
+        assert!(stored.expires_at > 0);
+        server.verify().await;
+    }
+
+    /// A seed has no identity to carry forward, and a refresh that returns
+    /// none must still succeed and persist the rotation rather than invent
+    /// one. `whoami` then reports an empty userid until a consent names it.
+    #[tokio::test]
+    async fn a_seeded_refresh_that_omits_identity_persists_the_rotation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .and(body_string_contains("refresh_token=seed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(documented_refresh_response("acc-1", "rot-1")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let manager = TokenManager::new(
+            WithingsClient::new(&server.uri()).unwrap(),
+            credentials(),
+            Box::new(MemoryStore::new()),
+            Some("seed"),
+        )
+        .unwrap();
+        assert_eq!(manager.peek().unwrap().unwrap().expires_at, 0);
+
+        manager.access_token().await.unwrap();
+        let stored = manager.peek().unwrap().unwrap();
+        assert_eq!(stored.refresh_token, "rot-1");
+        assert_eq!(stored.userid, "");
+        assert_eq!(stored.scope, "");
+        server.verify().await;
+    }
+
+    /// A value the refresh response does carry wins over the stored one, and
+    /// a numeric `userid` is held as a string. Invented id.
+    #[tokio::test]
+    async fn a_forced_refresh_with_a_numeric_userid_persists_it_as_a_string() {
+        let server = MockServer::start().await;
+        let mut body = documented_refresh_response("acc-1", "rot-1");
+        body["body"]["userid"] = json!(7_654_321);
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let manager = TokenManager::new(
+            WithingsClient::new(&server.uri()).unwrap(),
+            credentials(),
+            Box::new(expired_account()),
+            None,
+        )
+        .unwrap();
+
+        let handed_out = manager.access_token().await.unwrap();
+        assert_eq!(handed_out.userid, "7654321");
+        let stored = manager.peek().unwrap().unwrap();
+        assert_eq!(stored.userid, "7654321");
+        assert_eq!(stored.scope, "user.metrics");
+        server.verify().await;
+    }
+
+    /// Keeps the refresh token of every write but drops the identity after
+    /// the first: the half-state a lossy destination leaves.
+    #[derive(Debug, Default)]
+    struct IdentityDroppingStore {
+        tokens: RwLock<Option<StoredTokens>>,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TokenStore for IdentityDroppingStore {
+        fn load(&self) -> Result<Option<StoredTokens>> {
+            Ok(self.tokens.read().unwrap().clone())
+        }
+
+        fn save(&self, tokens: &StoredTokens) -> Result<()> {
+            let mut kept = tokens.clone();
+            if self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                kept.userid.clear();
+                kept.scope.clear();
+            }
+            *self.tokens.write().unwrap() = Some(kept);
+            Ok(())
+        }
+    }
+
+    /// The read-back checks the whole record. A store that kept the rotated
+    /// token and lost the carried-forward identity must not yield the new
+    /// access token, exactly as a store that lost the token does.
+    #[tokio::test]
+    async fn a_refresh_whose_identity_did_not_persist_never_yields_an_access_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(documented_refresh_response("acc-1", "rot-1")),
+            )
+            .mount(&server)
+            .await;
+        let store = IdentityDroppingStore::default();
+        store
+            .save(&StoredTokens {
+                userid: "1234567".to_owned(),
+                access_token: "acc-0".to_owned(),
+                refresh_token: "rot-0".to_owned(),
+                scope: "user.metrics".to_owned(),
+                expires_at: 0,
+            })
+            .unwrap();
+        let manager = TokenManager::new(
+            WithingsClient::new(&server.uri()).unwrap(),
+            credentials(),
+            Box::new(store),
+            None,
+        )
+        .unwrap();
+
+        let error = manager.access_token().await.unwrap_err();
+        assert!(format!("{error}").contains("read back"), "{error}");
+    }
+
+    /// A consent that does not name its account is refused before the store
+    /// is touched: only a refresh may inherit identity, and an adopt is where
+    /// a record's identity comes from.
+    #[tokio::test]
+    async fn an_adopt_without_userid_or_scope_fails_closed_and_stores_nothing() {
+        let manager = TokenManager::new(
+            WithingsClient::new("https://example.test").unwrap(),
+            credentials(),
+            Box::new(expired_account()),
+            None,
+        )
+        .unwrap();
+        let before = manager.peek().unwrap().unwrap();
+        let complete = TokenResponse {
+            userid: Some("7654321".to_owned()),
+            access_token: "acc-new".to_owned(),
+            refresh_token: "rot-new".to_owned(),
+            scope: Some("user.metrics".to_owned()),
+            expires_in: 10_800,
+        };
+        for incomplete in [
+            TokenResponse {
+                userid: None,
+                ..complete.clone()
+            },
+            TokenResponse {
+                scope: None,
+                ..complete.clone()
+            },
+            TokenResponse {
+                userid: Some(String::new()),
+                ..complete.clone()
+            },
+        ] {
+            let error = manager.adopt(&incomplete).await.unwrap_err();
+            assert!(!format!("{error:#}").contains("rot-new"), "{error:#}");
+            assert_eq!(manager.peek().unwrap().unwrap(), before);
+        }
+        manager.adopt(&complete).await.unwrap();
+        assert_eq!(manager.peek().unwrap().unwrap().userid, "7654321");
+    }
+
+    /// A forced refresh Withings answers with a non-zero status must leave the
+    /// store exactly as it was: the seed is still the only live credential.
+    /// `503` is the documented "invalid params" status and is not specially
+    /// mapped, so it arrives as `Api { status: 503 }` with the number intact.
+    #[tokio::test]
+    async fn a_refused_forced_refresh_keeps_the_status_and_persists_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 503, "error": "invented detail"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager = TokenManager::new(
+            WithingsClient::new(&server.uri()).unwrap(),
+            credentials(),
+            Box::new(MemoryStore::new()),
+            Some("seed"),
+        )
+        .unwrap();
+        let before = manager.peek().unwrap().unwrap();
+
+        let error = manager.access_token().await.unwrap_err();
+        assert!(
+            matches!(error, WithingsError::Api { status: 503 }),
+            "{error:?}"
+        );
+        assert_eq!(manager.peek().unwrap().unwrap(), before);
         server.verify().await;
     }
 
@@ -719,10 +1026,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         manager
             .adopt(&TokenResponse {
-                userid: "1234567".to_owned(),
+                userid: Some("1234567".to_owned()),
                 access_token: "acc-adopted".to_owned(),
                 refresh_token: "rot-adopted".to_owned(),
-                scope: "user.metrics".to_owned(),
+                scope: Some("user.metrics".to_owned()),
                 expires_in: 10_800,
             })
             .await

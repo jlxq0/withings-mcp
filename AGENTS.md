@@ -176,6 +176,29 @@ Required regression coverage:
   requests. `401` is separated from `250` because only the first is
   recoverable by refreshing.
 
+- **The two grants answer with different shapes, and only a refresh may
+  inherit identity.** Withings' documented `authorization_code` response
+  carries `userid` (a JSON **number**) and `scope`; its documented
+  `refresh_token` response carries only `access_token`, `refresh_token` and
+  `expires_in`. Requiring either field made every successful refresh a
+  `withings_invalid_response` with the rotation unpersisted, and every
+  fixture used a string `userid`, so the suite stayed green. A refresh now
+  carries `userid`/`scope` forward from the stored record, and the read-back
+  compares the **whole** record, so a store that keeps the token and loses the
+  identity is refused like one that loses the token. A consent is the
+  record's origin and fails closed without both, in `exchange_code` and again
+  in `adopt`. Making `userid` required again reds six tests, measured
+  2026-09-28.
+
+- **A Withings failure names its stage and number.** `mcp::map_withings_error`
+  puts `stage` (`refresh` for anything behind `access_token`, `measure` for
+  `getmeas`) and `withings_status` / `http_status` into `error.data`, and
+  emits one `Withings call failed` warn with only those fields and the code
+  string — never the error's `Display`, a body, a token or a userid.
+  `whoami` never reaches `measure`, so it failing the same way as a read
+  isolates the refresh. A status such as `503` ("invalid params") says
+  Withings refused the request, not which input it objected to.
+
 - **A measure is an integer and a base-10 exponent, so an unscaled value is a
   confidently wrong number rather than a missing one.** 70.5 kg arrives as
   `{"value": 70500, "unit": -3}`. Emitting `value` reports a weight of 70,500.
