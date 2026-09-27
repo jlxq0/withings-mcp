@@ -116,6 +116,80 @@ impl StoredTokens {
     }
 }
 
+/// Which token-store operation failed on the way to an access token.
+///
+/// This, and [`store_cause`], is everything about a store failure that leaves
+/// this module. A store's own error is free text: `FileStore`'s can carry a
+/// path, and a custom store's can quote the file it failed to parse, which
+/// holds the credential. So neither a log line nor an MCP error carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreStep {
+    /// Reading the stored tokens, before a refresh or under the gate.
+    Load,
+    /// Writing the rotated tokens.
+    Persist,
+    /// Reading the rotated tokens back after writing them.
+    ReadBack,
+    /// The read-back succeeded and returned something else.
+    Mismatch,
+}
+
+impl StoreStep {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Persist => "persist",
+            Self::ReadBack => "read_back",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+impl fmt::Display for StoreStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A bounded description of a store error: a class and, for an I/O failure,
+/// its [`std::io::ErrorKind`]. Both come from fixed sets, so they are safe to
+/// log where the error's `Display` is not.
+#[must_use]
+pub fn store_cause(error: &anyhow::Error) -> (&'static str, Option<std::io::ErrorKind>) {
+    if error
+        .chain()
+        .any(<dyn std::error::Error>::is::<WithingsError>)
+    {
+        return ("withings", None);
+    }
+    if error
+        .chain()
+        .any(<dyn std::error::Error>::is::<serde_json::Error>)
+    {
+        return ("parse", None);
+    }
+    let io_kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind);
+    (if io_kind.is_some() { "io" } else { "other" }, io_kind)
+}
+
+/// Log a store failure by step and bounded cause, and turn it into the error
+/// the caller sees. The only place a store error on the refresh path is
+/// reported, so there is one thing to keep free of the error's text.
+fn store_failure(step: StoreStep, error: &anyhow::Error) -> WithingsError {
+    let (cause, io_kind) = store_cause(error);
+    warn!(
+        step = step.as_str(),
+        cause,
+        ?io_kind,
+        "token store failed; not using a new access token"
+    );
+    WithingsError::TokenStore { step }
+}
+
 /// Where the rotated refresh token is kept between refreshes.
 ///
 /// Implementations must be usable from many tasks at once. `save` is called
@@ -406,27 +480,28 @@ impl TokenManager {
     /// stops a concurrent mutation superseding the value being stored, this
     /// stops a stored value being skipped altogether. Neither makes the other
     /// redundant.
+    ///
+    /// Every failure here is reported through [`store_failure`], by step and
+    /// never by the store's own text.
     fn persist_before_use(&self, refreshed: &StoredTokens) -> Result<(), WithingsError> {
-        if let Err(error) = self.store.save(refreshed) {
-            warn!(%error, "refreshed tokens could not be persisted; not using the new access token");
-            return Err(WithingsError::InvalidInput(format!(
-                "persist refreshed tokens: {error}"
-            )));
-        }
-        let read_back = self.store.load().map_err(|error| {
-            warn!(%error, "refreshed tokens could not be read back");
-            WithingsError::InvalidInput(format!("read back refreshed tokens: {error}"))
-        })?;
+        self.store
+            .save(refreshed)
+            .map_err(|error| store_failure(StoreStep::Persist, &error))?;
+        let read_back = self
+            .store
+            .load()
+            .map_err(|error| store_failure(StoreStep::ReadBack, &error))?;
         // The whole record, not only the refresh token: a store that kept the
         // token but lost the carried-forward identity is half a state, and
         // `whoami` would read it back blank.
         if read_back.as_ref() != Some(refreshed) {
             warn!(
+                step = StoreStep::Mismatch.as_str(),
                 "token store did not read back the refreshed token; not using the new access token"
             );
-            return Err(WithingsError::InvalidInput(
-                "token store did not read back the refreshed token".to_owned(),
-            ));
+            return Err(WithingsError::TokenStore {
+                step: StoreStep::Mismatch,
+            });
         }
         Ok(())
     }
@@ -434,7 +509,7 @@ impl TokenManager {
     fn load_or_unauthorized(&self) -> Result<StoredTokens, WithingsError> {
         self.store
             .load()
-            .map_err(|error| WithingsError::InvalidInput(format!("read token store: {error}")))?
+            .map_err(|error| store_failure(StoreStep::Load, &error))?
             .filter(|tokens| !tokens.refresh_token.is_empty())
             .ok_or(WithingsError::InvalidGrant)
     }
@@ -736,7 +811,15 @@ mod tests {
         .unwrap();
 
         let error = manager.access_token().await.unwrap_err();
-        assert!(format!("{error}").contains("read back"), "{error}");
+        assert!(
+            matches!(
+                error,
+                WithingsError::TokenStore {
+                    step: StoreStep::Mismatch
+                }
+            ),
+            "{error}"
+        );
     }
 
     /// A consent that does not name its account is refused before the store
@@ -930,7 +1013,12 @@ mod tests {
             .ok_or("a dropped write must not yield an access token")
             .unwrap();
         assert!(
-            format!("{error}").contains("read back"),
+            matches!(
+                error,
+                WithingsError::TokenStore {
+                    step: StoreStep::Mismatch
+                }
+            ),
             "expected the read-back to catch a silent drop: {error}"
         );
 
@@ -939,7 +1027,17 @@ mod tests {
             .err()
             .ok_or("a failed write must not yield an access token")
             .unwrap();
-        assert!(format!("{error}").contains("persist"), "{error}");
+        assert!(
+            matches!(
+                error,
+                WithingsError::TokenStore {
+                    step: StoreStep::Persist
+                }
+            ),
+            "{error}"
+        );
+        // The store said "disk is full"; the caller hears the step only.
+        assert!(!format!("{error}").contains("disk"), "{error}");
     }
 
     /// A handle onto a shared [`RecordingStore`], so the test can read the

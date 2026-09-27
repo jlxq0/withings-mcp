@@ -276,7 +276,14 @@ async fn oauth_callback(
         }
         Ok(response) => {
             if let Err(error) = state.tokens.adopt(&response).await {
-                warn!(%error, "oauth callback could not persist the new tokens");
+                // By bounded cause only: the store's text can name its path
+                // or quote the file, and this is the credential being replaced.
+                let (cause, io_kind) = crate::token::store_cause(&error);
+                warn!(
+                    cause,
+                    ?io_kind,
+                    "oauth callback could not persist the new tokens"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "authorised, but the tokens could not be stored\n",
@@ -1018,7 +1025,221 @@ mod tests {
         "rot-secret-value",
         "invented-private-detail",
         "1234567",
+        STORE_SENTINEL,
+        "/invented/private",
     ];
+
+    /// What [`SentinelStore`] puts in every error it raises: an invented path
+    /// and a marker, next to the rotated token a real store could quote.
+    const STORE_SENTINEL: &str = "invented-store-sentinel";
+
+    /// One way a token store breaks, by which call fails.
+    #[derive(Debug, Clone, Copy)]
+    enum Breakage {
+        /// The `n`th `load` (1-based) errors.
+        LoadFails(usize),
+        /// The `n`th `load` returns a file that does not parse.
+        LoadUnparsable(usize),
+        /// Every `save` errors.
+        SaveFails,
+    }
+
+    /// A store holding a stale credential that breaks as told, with errors
+    /// that carry everything a log line or envelope must not.
+    #[derive(Debug)]
+    struct SentinelStore {
+        tokens: std::sync::Mutex<crate::token::StoredTokens>,
+        loads: std::sync::atomic::AtomicUsize,
+        breakage: Breakage,
+    }
+
+    impl SentinelStore {
+        fn new(breakage: Breakage) -> Self {
+            Self {
+                tokens: std::sync::Mutex::new(crate::token::StoredTokens {
+                    userid: "1234567".to_owned(),
+                    access_token: "acc-old".to_owned(),
+                    refresh_token: "seed-secret-value".to_owned(),
+                    scope: "user.metrics".to_owned(),
+                    expires_at: 0,
+                }),
+                loads: std::sync::atomic::AtomicUsize::new(0),
+                breakage,
+            }
+        }
+    }
+
+    impl TokenStore for SentinelStore {
+        fn load(&self) -> Result<Option<crate::token::StoredTokens>> {
+            use anyhow::Context as _;
+            let n = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            match self.breakage {
+                Breakage::LoadFails(at) if at == n => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("/invented/private/state.json: {STORE_SENTINEL} rot-secret-value"),
+                ))
+                .context(format!("{STORE_SENTINEL} at /invented/private/state.json")),
+                Breakage::LoadUnparsable(at) if at == n => {
+                    let file = format!(
+                        r#"{{"refresh_token":"rot-secret-value","note":"{STORE_SENTINEL}","userid":"#
+                    );
+                    serde_json::from_str::<crate::token::StoredTokens>(&file)
+                        .map(Some)
+                        .context(format!("{STORE_SENTINEL}: parse {file}"))
+                }
+                _ => Ok(Some(self.tokens.lock().unwrap().clone())),
+            }
+        }
+
+        fn save(&self, tokens: &crate::token::StoredTokens) -> Result<()> {
+            if matches!(self.breakage, Breakage::SaveFails) {
+                anyhow::bail!(
+                    "{STORE_SENTINEL}: /invented/private/state.json full, lost {}",
+                    tokens.refresh_token
+                );
+            }
+            *self.tokens.lock().unwrap() = tokens.clone();
+            Ok(())
+        }
+    }
+
+    /// A token store that fails anywhere on the way to an access token says
+    /// which step, as `store_step` beside `stage: refresh`, on the wire and in
+    /// one log event, and never what the store said: its error text names an
+    /// invented path, a marker and the rotated token. `measure` is never
+    /// reached, so no new access token was used, which is the fail-closed half.
+    ///
+    /// Loads are counted from 1 and nothing seeds, so load 1 is the first read,
+    /// load 2 is the re-read under the gate and load 3 is the read-back.
+    #[tokio::test]
+    async fn a_token_store_failure_names_its_step_and_nothing_private() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": 0,
+                "body": {
+                    "access_token": "acc-secret-value",
+                    "refresh_token": "rot-secret-value",
+                    "expires_in": 10800
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/measure"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(measure_body()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cases = [
+            (Breakage::LoadFails(1), "load", "io"),
+            (Breakage::LoadUnparsable(1), "load", "parse"),
+            (Breakage::LoadFails(2), "load", "io"),
+            (Breakage::SaveFails, "persist", "other"),
+            (Breakage::LoadFails(3), "read_back", "io"),
+            (Breakage::LoadUnparsable(3), "read_back", "parse"),
+        ];
+        for (breakage, step, cause) in cases {
+            let captured = Captured::default();
+            let _guard = captured.install();
+            let app = build_with_store(
+                &origin_config(&server.uri()),
+                Box::new(SentinelStore::new(breakage)),
+                None,
+            );
+            let envelope = tool_call_envelope(app, "latest_measurements", "{}").await;
+            let data = &envelope["error"]["data"];
+            assert_eq!(
+                data["code"], "token_store_error",
+                "{breakage:?}: {envelope}"
+            );
+            assert_eq!(data["class"], "internal", "{breakage:?}: {envelope}");
+            assert_eq!(data["stage"], "refresh", "{breakage:?}: {envelope}");
+            assert_eq!(data["store_step"], step, "{breakage:?}: {envelope}");
+            assert_nothing_private(&format!("{breakage:?} envelope"), &envelope.to_string());
+
+            let text = captured.text();
+            let failures = captured.failures();
+            assert_eq!(failures.len(), 1, "{breakage:?}: {text}");
+            assert_eq!(failures[0]["store_step"], step, "{breakage:?}: {text}");
+            let store_events: Vec<_> = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| {
+                    event["fields"]["message"] == "token store failed; not using a new access token"
+                })
+                .collect();
+            assert_eq!(store_events.len(), 1, "{breakage:?}: {text}");
+            assert_eq!(store_events[0]["fields"]["step"], step, "{breakage:?}");
+            assert_eq!(store_events[0]["fields"]["cause"], cause, "{breakage:?}");
+            assert_nothing_private(&format!("{breakage:?} log"), &text);
+        }
+        server.verify().await;
+    }
+
+    /// The OAuth callback replacing the credential logs a store failure by
+    /// bounded cause, not by the store's text.
+    #[tokio::test]
+    async fn the_oauth_callback_logs_a_store_failure_without_its_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(token_body("acc-secret-value", "rot-secret-value")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = test_config(&server.uri());
+        config.oauth_state = Some(Secret::new("expected-state"));
+        config.redirect_uri = Some("https://example.test/oauth/callback".to_owned());
+        let withings = WithingsClient::new(&config.api_base_url).unwrap();
+        let tokens = Arc::new(
+            TokenManager::new(
+                withings.clone(),
+                ClientCredentials {
+                    client_id: config.client_id.clone(),
+                    client_secret: config.client_secret.expose().to_owned(),
+                },
+                Box::new(SentinelStore::new(Breakage::SaveFails)),
+                None,
+            )
+            .unwrap(),
+        );
+        let app = build_router(
+            &config,
+            withings,
+            tokens,
+            &Arc::new(Limiter::new(100).unwrap()),
+        );
+
+        let captured = Captured::default();
+        let _guard = captured.install();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/callback?code=fresh-code&state=expected-state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8_lossy(&to_bytes(response.into_body(), 4096).await.unwrap())
+            .into_owned();
+        assert_nothing_private("the callback body", &body);
+        let text = captured.text();
+        assert!(
+            text.contains("oauth callback could not persist the new tokens"),
+            "{text}"
+        );
+        assert_nothing_private("the callback log", &text);
+        server.verify().await;
+    }
 
     fn assert_nothing_private(what: &str, text: &str) {
         for private in PRIVATE {

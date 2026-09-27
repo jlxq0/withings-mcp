@@ -182,6 +182,9 @@ impl Stage {
 /// `503` during a refresh cannot be told from `503` during a read. The same
 /// fields go to one `warn` event.
 ///
+/// A local token-store failure carries `store_step` (`load`, `persist`,
+/// `read_back` or `mismatch`) in the same way, and never the store's text.
+///
 /// Only the stage, the stable code string and the numbers leave this
 /// function: never the error's `Display` (a transport error's source can name
 /// the URL), a response body, a token or a user id.
@@ -195,11 +198,16 @@ fn map_withings_error(stage: Stage, error: WithingsError) -> ErrorData {
         WithingsError::Upstream { status } => Some(status),
         _ => None,
     };
+    let store_step = match error {
+        WithingsError::TokenStore { step } => Some(step.as_str()),
+        _ => None,
+    };
     tracing::warn!(
         stage = stage.as_str(),
         code,
         withings_status,
         http_status,
+        store_step,
         "Withings call failed"
     );
     let mut mapped = match error {
@@ -226,6 +234,13 @@ fn map_withings_error(stage: Stage, error: WithingsError) -> ErrorData {
             ),
             None,
         ),
+        WithingsError::TokenStore { step } => ErrorData::internal_error(
+            format!(
+                "{code}: the local token store failed at {step} during {}; no new access token was used",
+                stage.as_str()
+            ),
+            None,
+        ),
         other => ErrorData::internal_error(other.code(), None),
     };
     let class = audit::error_class(&mapped);
@@ -239,6 +254,9 @@ fn map_withings_error(stage: Stage, error: WithingsError) -> ErrorData {
         }
         if let Some(status) = http_status {
             fields.insert("http_status".to_owned(), json!(status));
+        }
+        if let Some(step) = store_step {
+            fields.insert("store_step".to_owned(), json!(step));
         }
     }
     mapped

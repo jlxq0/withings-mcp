@@ -17,6 +17,8 @@ use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
+use crate::token::StoreStep;
+
 /// Withings' public API root. Both the `OAuth2` and measure services live here.
 pub const DEFAULT_API_BASE_URL: &str = "https://wbsapi.withings.net";
 
@@ -64,6 +66,11 @@ pub enum WithingsError {
     Transport(#[source] reqwest::Error),
     #[error("Withings API returned invalid JSON")]
     InvalidJson(#[source] serde_json::Error),
+    /// The local token store failed. Carries the step and nothing else: a
+    /// store's own error can name a path or quote the file it could not
+    /// parse, and that file holds the credential.
+    #[error("token store failed at {step}")]
+    TokenStore { step: StoreStep },
 }
 
 impl WithingsError {
@@ -77,6 +84,7 @@ impl WithingsError {
             Self::Upstream { .. } => "withings_upstream_error",
             Self::Transport(_) => "withings_transport_error",
             Self::InvalidJson(_) => "withings_invalid_response",
+            Self::TokenStore { .. } => "token_store_error",
         }
     }
 }
