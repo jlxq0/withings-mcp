@@ -199,6 +199,14 @@ Required regression coverage:
   isolates the refresh. A status such as `503` ("invalid params") says
   Withings refused the request, not which input it objected to.
 
+- **No log line carries a Withings userid.** Startup used to log the stored
+  one on every release start. `no_log_line_carries_a_userid` scans every file
+  in `src/` for a `userid` tracing field or a `%`/`?` capture of one, and
+  `startup_with_stored_tokens_does_not_log_the_userid` drives `build_app`.
+  Restoring the old startup line reds both, measured 2026-09-28. The scan
+  lists files by name, so a new source file must be added to it. `exchange`
+  printing the userid to the consenting operator's terminal is deliberate.
+
 - **A measure is an integer and a base-10 exponent, so an unscaled value is a
   confidently wrong number rather than a missing one.** 70.5 kg arrives as
   `{"value": 70500, "unit": -3}`. Emitting `value` reports a weight of 70,500.

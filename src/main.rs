@@ -116,7 +116,9 @@ fn build_app(config: &Config) -> Result<Router> {
         Some(stored) if stored.access_token.is_empty() => {
             info!("holding a seed refresh token; the first tool call will refresh");
         }
-        Some(stored) => info!(userid = %stored.userid, "holding stored Withings tokens"),
+        // No userid: it is account content, and this line is in every
+        // release's startup log. `no_log_line_carries_a_userid` pins both.
+        Some(_) => info!("holding stored Withings tokens"),
         None => warn!(
             "no Withings credential: set the seed refresh token, or complete the oauth callback"
         ),
@@ -1230,5 +1232,73 @@ mod tests {
         assert!(!text.contains("rot-9"), "{text}");
         assert_eq!(tokens.peek().unwrap().unwrap(), existing);
         server.verify().await;
+    }
+
+    /// Startup reports that a credential is held, and not whose. A stored
+    /// record's userid is account content; this line runs on every release
+    /// start, so it would put the id in every deployment's log. Invented id.
+    #[tokio::test]
+    async fn startup_with_stored_tokens_does_not_log_the_userid() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        FileStore::new(&state)
+            .save(&crate::token::StoredTokens {
+                userid: "1234567".to_owned(),
+                access_token: "acc-secret-value".to_owned(),
+                refresh_token: "rot-secret-value".to_owned(),
+                scope: "user.metrics".to_owned(),
+                expires_at: 0,
+            })
+            .unwrap();
+        let mut config = test_config("https://example.test");
+        config.token_state_path = Some(state);
+
+        let captured = Captured::default();
+        let _guard = captured.install();
+        let _app = build_app(&config).unwrap();
+        let text = captured.text();
+        assert!(text.contains("holding stored Withings tokens"), "{text}");
+        assert_nothing_private("the startup log", &text);
+    }
+
+    /// A static check over every source file: no tracing field is named
+    /// `userid` and no `%`/`?`-captured value is a userid. The runtime tests
+    /// cover the paths they drive; this covers a log line added on a path no
+    /// test drives. `exchange.rs` prints the userid to the operator's own
+    /// terminal on purpose, with `eprintln!`, which neither pattern matches.
+    #[test]
+    fn no_log_line_carries_a_userid() {
+        let field = concat!("user", "id");
+        let sources = [
+            ("audit.rs", include_str!("audit.rs")),
+            ("auth.rs", include_str!("auth.rs")),
+            ("config.rs", include_str!("config.rs")),
+            ("exchange.rs", include_str!("exchange.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("mcp.rs", include_str!("mcp.rs")),
+            ("measures.rs", include_str!("measures.rs")),
+            ("metrics.rs", include_str!("metrics.rs")),
+            ("rate_limit.rs", include_str!("rate_limit.rs")),
+            ("session.rs", include_str!("session.rs")),
+            ("telemetry.rs", include_str!("telemetry.rs")),
+            ("token.rs", include_str!("token.rs")),
+            ("withings_client.rs", include_str!("withings_client.rs")),
+        ];
+        for (file, source) in sources {
+            for (number, line) in source.lines().enumerate() {
+                let compact: String = line.split_whitespace().collect();
+                let named_field = compact.contains(&format!("{field}=%"))
+                    || compact.contains(&format!("{field}=?"))
+                    || compact.contains(&format!("{field}={field}"));
+                let captured = line
+                    .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')'))
+                    .any(|token| token.starts_with(['%', '?']) && token.contains(field));
+                assert!(
+                    !named_field && !captured,
+                    "{file}:{} logs a {field}: {line}",
+                    number + 1
+                );
+            }
+        }
     }
 }
