@@ -57,8 +57,14 @@ pub async fn run() -> Result<()> {
     writeln!(stdout, "{}", tokens.refresh_token)?;
     stdout.flush()?;
 
-    eprintln!("userid:  {}", tokens.userid);
-    eprintln!("scope:   {}", tokens.scope);
+    eprintln!(
+        "userid:  {}",
+        tokens.userid.as_deref().unwrap_or("<not returned>")
+    );
+    eprintln!(
+        "scope:   {}",
+        tokens.scope.as_deref().unwrap_or("<not returned>")
+    );
     eprintln!("expires: access token in {}s", tokens.expires_in);
     eprintln!();
     eprintln!(

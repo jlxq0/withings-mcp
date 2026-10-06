@@ -17,6 +17,8 @@ use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
+use crate::token::StoreStep;
+
 /// Withings' public API root. Both the `OAuth2` and measure services live here.
 pub const DEFAULT_API_BASE_URL: &str = "https://wbsapi.withings.net";
 
@@ -64,6 +66,11 @@ pub enum WithingsError {
     Transport(#[source] reqwest::Error),
     #[error("Withings API returned invalid JSON")]
     InvalidJson(#[source] serde_json::Error),
+    /// The local token store failed. Carries the step and nothing else: a
+    /// store's own error can name a path or quote the file it could not
+    /// parse, and that file holds the credential.
+    #[error("token store failed at {step}")]
+    TokenStore { step: StoreStep },
 }
 
 impl WithingsError {
@@ -77,6 +84,7 @@ impl WithingsError {
             Self::Upstream { .. } => "withings_upstream_error",
             Self::Transport(_) => "withings_transport_error",
             Self::InvalidJson(_) => "withings_invalid_response",
+            Self::TokenStore { .. } => "token_store_error",
         }
     }
 }
@@ -85,14 +93,59 @@ impl WithingsError {
 ///
 /// `refresh_token` is present on both grants: Withings rotates it on every
 /// refresh, so the value here always replaces the one that produced it.
+///
+/// `userid` and `scope` are optional because the two grants do not answer
+/// with the same shape. Withings' documented `authorization_code` response
+/// carries both, with `userid` as a JSON number; its documented
+/// `refresh_token` response carries only `access_token`, `refresh_token` and
+/// `expires_in`. Requiring either field turns every successful refresh into
+/// `withings_invalid_response` with the rotated token unpersisted. The token
+/// manager carries the stored values forward when a refresh omits them.
 #[derive(Clone, Deserialize)]
 pub struct TokenResponse {
-    pub userid: String,
+    #[serde(default, deserialize_with = "userid_as_string")]
+    pub userid: Option<String>,
     pub access_token: String,
     pub refresh_token: String,
     #[serde(default)]
-    pub scope: String,
+    pub scope: Option<String>,
     pub expires_in: u64,
+}
+
+impl TokenResponse {
+    /// Refuse a response that does not name the account and its scope.
+    ///
+    /// Required of an authorisation, never of a refresh. The error names the
+    /// missing field and nothing else.
+    pub fn require_identity(&self) -> Result<(), WithingsError> {
+        for (field, value) in [("userid", &self.userid), ("scope", &self.scope)] {
+            if value.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                return Err(WithingsError::InvalidJson(serde_json::Error::io(
+                    std::io::Error::other(format!("authorization response has no `{field}`")),
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Accept `userid` as a JSON string, a non-negative integer, or `null`.
+fn userid_as_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Userid {
+        Number(u64),
+        Text(String),
+    }
+    Ok(
+        Option::<Userid>::deserialize(deserializer)?.map(|userid| match userid {
+            Userid::Number(number) => number.to_string(),
+            Userid::Text(text) => text,
+        }),
+    )
 }
 
 /// Redacts both tokens. A `TokenResponse` reaches a log only through this.
@@ -183,6 +236,11 @@ impl WithingsClient {
     ///
     /// The code is single-use and short-lived; a second call with the same
     /// code is an `InvalidGrant`, not a transport failure.
+    ///
+    /// Fails closed on a response without a non-empty `userid` and `scope`.
+    /// Only a refresh may inherit those from a stored record; a consent is
+    /// the record's origin, so one that does not name its account is not an
+    /// authorisation this server can hold.
     pub async fn exchange_code(
         &self,
         credentials: &ClientCredentials,
@@ -192,15 +250,18 @@ impl WithingsClient {
         if code.trim().is_empty() {
             return Err(WithingsError::InvalidInput("code must not be empty".into()));
         }
-        self.request_token(&[
-            ("action", "requesttoken"),
-            ("grant_type", "authorization_code"),
-            ("client_id", &credentials.client_id),
-            ("client_secret", &credentials.client_secret),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-        ])
-        .await
+        let response = self
+            .request_token(&[
+                ("action", "requesttoken"),
+                ("grant_type", "authorization_code"),
+                ("client_id", &credentials.client_id),
+                ("client_secret", &credentials.client_secret),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+            ])
+            .await?;
+        response.require_identity()?;
+        Ok(response)
     }
 
     /// Trade a refresh token for a fresh pair.
@@ -421,7 +482,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(tokens.userid, "1234567");
+        assert_eq!(tokens.userid.as_deref(), Some("1234567"));
         assert_eq!(tokens.refresh_token, "refresh-2");
         assert_eq!(tokens.expires_in, 10800);
         server.verify().await;
@@ -446,6 +507,92 @@ mod tests {
         // credential that dies as soon as this access token is used.
         assert_eq!(tokens.refresh_token, "refresh-2");
         assert_ne!(tokens.refresh_token, "refresh-1");
+        server.verify().await;
+    }
+
+    /// Withings' documented `authorization_code` response carries `userid` as
+    /// a JSON number. Every earlier fixture used a string, so the documented
+    /// shape failed to parse and the suite stayed green. Invented id.
+    #[tokio::test]
+    async fn a_numeric_userid_parses_and_is_held_as_a_string() {
+        let server = MockServer::start().await;
+        let mut body = token_body();
+        body["body"]["userid"] = json!(1_234_567);
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client = WithingsClient::new(&server.uri()).unwrap();
+        let tokens = client
+            .exchange_code(
+                &credentials(),
+                "auth-code",
+                "https://example.test/oauth/callback",
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokens.userid.as_deref(), Some("1234567"));
+        assert_eq!(tokens.scope.as_deref(), Some("user.metrics"));
+    }
+
+    /// A consent that does not name its account fails closed, for either
+    /// missing field, rather than yielding a pair to be stored without one.
+    #[tokio::test]
+    async fn an_authorization_without_userid_or_scope_is_refused() {
+        for missing in ["userid", "scope"] {
+            let server = MockServer::start().await;
+            let mut body = token_body();
+            body["body"].as_object_mut().unwrap().remove(missing);
+            Mock::given(method("POST"))
+                .and(path("/v2/oauth2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            let client = WithingsClient::new(&server.uri()).unwrap();
+            let error = client
+                .exchange_code(
+                    &credentials(),
+                    "auth-code",
+                    "https://example.test/oauth/callback",
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "withings_invalid_response", "{missing}");
+            let rendered = format!("{error} {:?}", std::error::Error::source(&error));
+            assert!(rendered.contains(missing), "{rendered}");
+            assert!(!rendered.contains("refresh-2"), "{rendered}");
+        }
+    }
+
+    /// Withings' documented `refresh_token` response has no `userid` and no
+    /// `scope`. Requiring either made every successful refresh a parse error.
+    #[tokio::test]
+    async fn a_refresh_response_without_userid_or_scope_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": 0,
+                "body": {
+                    "access_token": "access-1",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 10800
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = WithingsClient::new(&server.uri()).unwrap();
+        let tokens = client.refresh(&credentials(), "refresh-1").await.unwrap();
+        assert_eq!(tokens.userid, None);
+        assert_eq!(tokens.scope, None);
+        assert_eq!(tokens.access_token, "access-1");
+        assert_eq!(tokens.refresh_token, "refresh-2");
+        assert_eq!(tokens.expires_in, 10800);
         server.verify().await;
     }
 
@@ -562,10 +709,10 @@ mod tests {
     #[test]
     fn debug_output_redacts_both_tokens_and_the_client_secret() {
         let tokens = TokenResponse {
-            userid: "1234567".to_owned(),
+            userid: Some("1234567".to_owned()),
             access_token: "super-secret-access".to_owned(),
             refresh_token: "super-secret-refresh".to_owned(),
-            scope: SCOPE.to_owned(),
+            scope: Some(SCOPE.to_owned()),
             expires_in: 10800,
         };
         let rendered = format!("{tokens:?}");
