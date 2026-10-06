@@ -41,7 +41,7 @@ subtle = "2.6"
 # session manager + http transport we mount via `Router::nest_service`.
 # rmcp re-exports `schemars` (1.x) — we use `rmcp::schemars`, never a
 # separately-versioned schemars dep.
-rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
+rmcp = { version = "2.1", features = ["transport-streamable-http-server"] }
 # `futures` is transitive via rmcp; listed so session.rs can name `Stream`.
 futures = { version = "0.3", default-features = false }
 # Hex-encode token-hash audit keys.
