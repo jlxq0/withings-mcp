@@ -153,7 +153,7 @@ fn build_router(
                 Arc::clone(&service_limiter),
             ))
         },
-        Arc::new(session::CappedSessionManager::new()),
+        session::CappedSessionManager::start(),
         StreamableHttpServerConfig::default().with_allowed_hosts(config.allowed_hosts.clone()),
     );
 
