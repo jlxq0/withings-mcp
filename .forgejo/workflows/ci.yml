@@ -5,6 +5,11 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # Daily, so an advisory published against an unchanged tree reds `main`
+  # the next morning rather than the next unrelated pull request. Only
+  # `cargo` runs on a schedule; there is nothing new to build an image of.
+  schedule:
+    - cron: "17 1 * * *"
 
 permissions:
   contents: read
@@ -62,6 +67,9 @@ jobs:
   docker:
     runs-on: ubuntu-22.04
     needs: cargo
+    # A scheduled run's ref is `main`, which is the `:buildcache` writer
+    # below. It builds nothing new, so it must not write anything either.
+    if: github.event_name != 'schedule'
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
