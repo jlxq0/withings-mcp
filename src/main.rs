@@ -316,7 +316,11 @@ async fn oauth_callback(
         drop(ticket);
         response
     });
-    completion.await.unwrap_or_else(|_| {
+    completion.await.unwrap_or_else(|error| {
+        warn!(
+            panicked = error.is_panic(),
+            "oauth callback completion did not finish"
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "the authorisation did not complete\n",
@@ -1385,12 +1389,17 @@ mod tests {
             .expect(u64::try_from(mcp::MAX_PAGES).unwrap())
             .mount(&server)
             .await;
-        let envelope = tool_call_envelope(
-            router_with_hosts(&server.uri(), &[ORIGIN]),
-            "list_measurements",
-            r#"{"limit":500}"#,
+        // Bounded, so a removed cap fails here rather than hanging the suite.
+        let envelope = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tool_call_envelope(
+                router_with_hosts(&server.uri(), &[ORIGIN]),
+                "list_measurements",
+                r#"{"limit":500}"#,
+            ),
         )
-        .await;
+        .await
+        .unwrap();
         let content = &envelope["result"]["structuredContent"];
         assert_eq!(content["complete"], false, "{envelope}");
         assert_eq!(content["returned"], mcp::MAX_PAGES, "{envelope}");
