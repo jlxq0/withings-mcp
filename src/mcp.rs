@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
@@ -20,7 +20,8 @@ use tracing::{Instrument as _, Span};
 
 use crate::audit::{self, WITHINGS_RATE_LIMITED_CODE, outcome};
 use crate::auth::AccessToken;
-use crate::measures::{self, Measurement};
+use crate::measures::{self, Measurement, Page};
+use crate::metrics;
 use crate::rate_limit::Limiter;
 use crate::token::{TokenManager, now_unix};
 use crate::withings_client::{MeasureQuery, WithingsClient, WithingsError};
@@ -32,6 +33,19 @@ const WITHINGS_INVALID_GRANT_CODE: i32 = -32_011;
 const MAX_LIMIT: usize = 500;
 /// Default number of measurements returned when `limit` is absent.
 const DEFAULT_LIMIT: usize = 50;
+/// `getmeas` pages followed before a read stops and says it is partial.
+///
+/// Withings pages a long range and says so with `more`. Reading only the first
+/// page and reporting it as the whole range is the same confident wrongness
+/// as an unscaled value: a series that ends early looks like a person who
+/// stopped measuring.
+pub const MAX_PAGES: usize = 20;
+
+/// Every measurement in a range, and whether that is all of them.
+struct Fetched {
+    measurements: Vec<Measurement>,
+    complete: bool,
+}
 
 #[derive(Clone)]
 pub struct WithingsMcpService {
@@ -94,11 +108,7 @@ impl WithingsMcpService {
         let span = make_tool_span(tool, &token_hash, resource);
         let result = async {
             self.rate_limit_check(context)?;
-            let tokens = self
-                .tokens
-                .access_token()
-                .await
-                .map_err(|error| map_withings_error(Stage::Refresh, error))?;
+            let tokens = self.access_token().await?;
             let value = call(tokens.access_token)
                 .await
                 .map_err(|error| map_withings_error(Stage::Measure, error))?;
@@ -110,13 +120,64 @@ impl WithingsMcpService {
         result
     }
 
+    /// A usable access token, recording whether the credential still works.
+    async fn access_token(&self) -> Result<crate::token::StoredTokens, ErrorData> {
+        match self.tokens.access_token().await {
+            Ok(tokens) => {
+                metrics::record_reauthorisation_required(false);
+                Ok(tokens)
+            }
+            Err(error) => {
+                if matches!(error, WithingsError::InvalidGrant) {
+                    metrics::record_reauthorisation_required(true);
+                }
+                Err(map_withings_error(Stage::Refresh, error))
+            }
+        }
+    }
+
+    /// Read every page of a range, up to [`MAX_PAGES`].
     async fn measurements(
         &self,
         access_token: &str,
         query: &MeasureQuery,
-    ) -> Result<Vec<Measurement>, WithingsError> {
-        let body = self.withings.get_measures(access_token, query).await?;
-        Ok(measures::flatten(&body))
+    ) -> Result<Fetched, WithingsError> {
+        let mut query = query.clone();
+        let mut measurements = Vec::new();
+        let mut stopped = "page_limit";
+        for _ in 0..MAX_PAGES {
+            let body = self.withings.get_measures(access_token, &query).await?;
+            measurements.extend(measures::flatten(&body));
+            match measures::next_page(&body) {
+                Page::Last => {
+                    return Ok(Fetched {
+                        measurements,
+                        complete: true,
+                    });
+                }
+                // An offset that does not move forward would page forever.
+                Page::Next(offset) if query.offset.is_none_or(|previous| offset > previous) => {
+                    query.offset = Some(offset);
+                }
+                Page::Next(_) => {
+                    stopped = "offset_did_not_advance";
+                    break;
+                }
+                Page::Unreadable => {
+                    stopped = "no_offset";
+                    break;
+                }
+            }
+        }
+        tracing::warn!(
+            stopped,
+            max_pages = MAX_PAGES,
+            "getmeas stopped before its last page; the result says it is partial"
+        );
+        Ok(Fetched {
+            measurements,
+            complete: false,
+        })
     }
 }
 
@@ -190,6 +251,7 @@ impl Stage {
 /// the URL), a response body, a token or a user id.
 fn map_withings_error(stage: Stage, error: WithingsError) -> ErrorData {
     let code = error.code();
+    metrics::record_withings_failure(stage.as_str(), code);
     let withings_status = match error {
         WithingsError::Api { status } => Some(status),
         _ => None,
@@ -387,11 +449,7 @@ impl WithingsMcpService {
         let span = make_tool_span("whoami", &token_hash, None);
         let result = async {
             self.rate_limit_check(&context)?;
-            let tokens = self
-                .tokens
-                .access_token()
-                .await
-                .map_err(|error| map_withings_error(Stage::Refresh, error))?;
+            let tokens = self.access_token().await?;
             let now = now_unix();
             Ok(structured_result(&json!({
                 "userid": tokens.userid,
@@ -471,12 +529,23 @@ impl WithingsMcpService {
         Parameters(params): Parameters<ListMeasurementsParams>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let meastypes = resolve_types(params.types.as_ref())?;
+        if let (Some(start), Some(end)) = (params.start, params.end)
+            && start > end
+        {
+            // Withings answers this with `503`, which would reach the caller
+            // as an internal error rather than as their own argument.
+            return Err(ErrorData::invalid_params(
+                format!("start ({start}) is after end ({end})"),
+                None,
+            ));
+        }
         let resource = meastypes
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(",");
         let limit = clamp_limit(params.limit);
+        let requested = meastypes.clone();
         let query = MeasureQuery {
             meastypes,
             category: Some(1),
@@ -489,15 +558,25 @@ impl WithingsMcpService {
             "list_measurements",
             Some(&resource),
             |access_token| async move {
-                let mut measurements = self.measurements(&access_token, &query).await?;
+                let Fetched {
+                    mut measurements,
+                    complete,
+                } = self.measurements(&access_token, &query).await?;
+                // `meastypes` asks Withings to filter. Filtering again here
+                // means a reading nobody asked for, which `scope=user.metrics`
+                // can include, never reaches a caller even if Withings ignores
+                // the parameter.
+                measurements.retain(|measurement| requested.contains(&measurement.meastype));
                 measurements.sort_by_key(|measurement| std::cmp::Reverse(measurement.taken_at));
                 let total = measurements.len();
                 measurements.truncate(limit);
                 Ok(json!({
                     "measurements": measurements,
                     "returned": measurements.len(),
+                    // A lower bound when `complete` is false.
                     "total_in_range": total,
-                    "truncated": total > limit,
+                    "truncated": total > limit || !complete,
+                    "complete": complete,
                 }))
             },
         )
@@ -541,7 +620,10 @@ impl WithingsMcpService {
             "latest_measurements",
             Some(&resource),
             |access_token| async move {
-                let measurements = self.measurements(&access_token, &query).await?;
+                let Fetched {
+                    measurements,
+                    complete,
+                } = self.measurements(&access_token, &query).await?;
                 let latest = measures::latest_per_type(&measurements)
                     .into_iter()
                     .filter(|measurement| requested.contains(&measurement.meastype))
@@ -561,6 +643,9 @@ impl WithingsMcpService {
                     // Naming what was asked for and not found keeps "never
                     // measured" from reading as "measured as nothing".
                     "no_reading_in_window": missing,
+                    // When false, a type named above may have a reading on a
+                    // page that was not read.
+                    "complete": complete,
                 }))
             },
         )
@@ -577,7 +662,14 @@ impl WithingsMcpService {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WithingsMcpService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        // Without `with_server_info`, rmcp names itself and its own version
+        // here, so a client could not tell which release it is talking to.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
             "withings-mcp reads body metrics from one authorised Withings account: weight, body \
              fat percentage, fat mass and muscle mass. It is read-only and has no tool that \
              writes to Withings. Call measurement_types for the names and units, \

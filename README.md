@@ -70,8 +70,21 @@ printf '%s\n%s\n%s\n' "$CLIENT_ID" "$CLIENT_SECRET" "$CODE" \
 
 A running deployment can also complete the flow at `GET /oauth/callback`, which
 exchanges the code and adopts the tokens. That endpoint **replaces the server's
-credential**, so it is disabled unless `WITHINGS_MCP_OAUTH_STATE` is set, and
-the `state` query parameter must match it.
+credential**, and the `state` it checks is static and sits in every consent
+URL, so it is gated three ways:
+
+- it is disabled unless `WITHINGS_MCP_OAUTH_STATE` is set, and the `state`
+  query parameter must match it;
+- it is open only for `WITHINGS_MCP_OAUTH_WINDOW_SECS` (default 600, at most
+  3600) after the process starts, and it closes for good on the first
+  authorisation it adopts;
+- it closes after five wrong `state` values. A request with no `state` is not
+  counted, but anyone can send five wrong ones, so if it closed before you
+  consented, restart and try again.
+
+Closed, used and disabled all answer the same `404`. To re-authorise, restart
+the process and consent inside the window. Use a long random `state`; one
+shorter than 32 characters is warned about at startup.
 
 ## Tools
 
@@ -99,6 +112,15 @@ and named in `no_reading_in_window`, never returned as zero. An unknown type
 name is an error rather than a silent omission, because three series where four
 were asked for is indistinguishable from a missing measurement.
 
+Withings pages a long range. Both reads follow the pages, up to 20, and say
+`"complete": true` when they reached the last one. `false` means the range had
+more than was read: `list_measurements` then reports `"truncated": true`, and
+neither the newest readings nor `no_reading_in_window` can be trusted, because
+which end of the range Withings pages from has not been measured. Each page is
+a Withings call, so one tool call can make up to 20.
+
+`list_measurements` with a `start` after its `end` is an invalid argument.
+
 A rate limit — ours or Withings' — reaches the caller as a JSON-RPC error with
 `data.class == "rate_limited"`. An empty series is a successful result. One
 comparison separates "unreadable" from "nothing recorded".
@@ -112,7 +134,8 @@ WITHINGS_MCP_CLIENT_SECRET=<Withings client secret>
 WITHINGS_MCP_REFRESH_TOKEN=<seed refresh token>
 WITHINGS_MCP_TOKEN_STATE_PATH=/var/lib/withings-mcp/tokens.json
 WITHINGS_MCP_REDIRECT_URI=https://withings-mcp.example/oauth/callback
-WITHINGS_MCP_OAUTH_STATE=<opaque value>
+WITHINGS_MCP_OAUTH_STATE=<long random value>
+WITHINGS_MCP_OAUTH_WINDOW_SECS=600
 WITHINGS_MCP_ALLOWED_HOSTS=withings-mcp.example
 WITHINGS_MCP_API_BASE_URL=https://wbsapi.withings.net
 WITHINGS_MCP_BIND_ADDR=0.0.0.0:3000
@@ -133,6 +156,19 @@ origin is deployment configuration.
 The token state file holds a live credential. It is written `0600` and replaced
 atomically, and it belongs only on storage the deployment already treats as
 secret.
+
+## Metrics
+
+The internal listener serves Prometheus text at `/metrics`. Besides tool call
+counts and latency:
+
+- `withings_mcp_withings_failures_total{stage, code}` counts failed Withings
+  calls by `refresh` or `measure` and the stable error code;
+- `withings_mcp_reauthorisation_required` is `1` once a refresh has found the
+  stored authorisation dead, and `0` once a token has been served again.
+
+`/health` answers `200` regardless, because it is the liveness probe and a
+restart cannot revive a refresh token. Alert on the gauge instead.
 
 ## Development
 

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::oauth_gate;
 use crate::withings_client::DEFAULT_API_BASE_URL;
 
 const ENV_API_BASE_URL: &str = "WITHINGS_MCP_API_BASE_URL";
@@ -30,6 +31,7 @@ const ENV_REFRESH_TOKEN: &str = "WITHINGS_MCP_REFRESH_TOKEN";
 const ENV_TOKEN_STATE_PATH: &str = "WITHINGS_MCP_TOKEN_STATE_PATH";
 const ENV_REDIRECT_URI: &str = "WITHINGS_MCP_REDIRECT_URI";
 const ENV_OAUTH_STATE: &str = "WITHINGS_MCP_OAUTH_STATE";
+const ENV_OAUTH_WINDOW_SECS: &str = "WITHINGS_MCP_OAUTH_WINDOW_SECS";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 // A connector opens a fresh session on every reconnect, and a reconnect loop
@@ -98,6 +100,9 @@ pub struct Config {
     /// Value the `state` query parameter must equal for `/oauth/callback` to
     /// act. Absent disables the callback entirely.
     pub oauth_state: Option<Secret>,
+    /// How long after startup the callback stays open. It also closes on the
+    /// first authorisation it adopts. See `oauth_gate`.
+    pub oauth_callback_window: Duration,
 }
 
 impl Config {
@@ -129,6 +134,7 @@ impl Config {
             token_state_path: None,
             redirect_uri: None,
             oauth_state: None,
+            oauth_callback_window: oauth_gate::DEFAULT_WINDOW,
         })
     }
 
@@ -163,6 +169,17 @@ impl Config {
         config.token_state_path = optional(ENV_TOKEN_STATE_PATH).map(PathBuf::from);
         config.redirect_uri = optional(ENV_REDIRECT_URI);
         config.oauth_state = optional(ENV_OAUTH_STATE).map(Secret::new);
+        if std::env::var(ENV_OAUTH_WINDOW_SECS).is_ok() {
+            config.oauth_callback_window =
+                Duration::from_secs(u64::from(parse_rate_limit(ENV_OAUTH_WINDOW_SECS, 0)?));
+            // Longer is a standing door again, which the window exists to
+            // remove.
+            anyhow::ensure!(
+                config.oauth_callback_window <= oauth_gate::MAX_WINDOW,
+                "{ENV_OAUTH_WINDOW_SECS} must be at most {}",
+                oauth_gate::MAX_WINDOW.as_secs()
+            );
+        }
         if let Some(redirect_uri) = &config.redirect_uri {
             validate_url(redirect_uri, ENV_REDIRECT_URI)?;
         }
@@ -304,6 +321,9 @@ mod tests {
         assert!(config.token_state_path.is_none());
         assert!(config.redirect_uri.is_none());
         assert!(config.oauth_state.is_none());
+        // Even once a state is configured, the callback is a window after
+        // startup rather than a standing door.
+        assert_eq!(config.oauth_callback_window, Duration::from_mins(10));
     }
 
     #[test]

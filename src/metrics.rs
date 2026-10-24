@@ -33,7 +33,8 @@ use std::time::Duration;
 use axum::http::header;
 use axum::response::IntoResponse;
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, TextEncoder, register_int_counter_vec_with_registry,
+    Encoder, HistogramVec, IntCounterVec, IntGauge, TextEncoder,
+    register_int_counter_vec_with_registry, register_int_gauge_with_registry,
 };
 use std::sync::LazyLock;
 
@@ -65,6 +66,35 @@ pub static TOOL_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("register tool_latency_seconds once")
 });
 
+/// Failed Withings calls by where they failed and the stable error code.
+///
+/// Both labels are closed sets: `stage` is `refresh` or `measure`, and `code`
+/// is `WithingsError::code`. Nothing about the account or the token.
+pub static WITHINGS_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "withings_mcp_withings_failures_total",
+        "Failed Withings calls. Labels: stage, code.",
+        &["stage", "code"],
+        prometheus::default_registry()
+    )
+    .expect("register withings_failures_total once")
+});
+
+/// 1 once a refresh has said the stored authorisation is dead, 0 once a token
+/// has been served again.
+///
+/// `/health` answers 200 regardless, and must: it is the liveness probe, and
+/// restarting a process cannot revive a refresh token. This is the signal a
+/// person can alert on instead.
+pub static REAUTHORISATION_REQUIRED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge_with_registry!(
+        "withings_mcp_reauthorisation_required",
+        "1 when the stored Withings authorisation was last found dead, else 0.",
+        prometheus::default_registry()
+    )
+    .expect("register reauthorisation_required once")
+});
+
 /// Initialize all metrics. Idempotent — `LazyLock` ensures
 /// registration only happens once. Call this once at startup so the
 /// scraped `/metrics` text always lists the families even before
@@ -72,6 +102,20 @@ pub static TOOL_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub fn init() {
     LazyLock::force(&TOOL_CALLS_TOTAL);
     LazyLock::force(&TOOL_LATENCY_SECONDS);
+    LazyLock::force(&WITHINGS_FAILURES_TOTAL);
+    LazyLock::force(&REAUTHORISATION_REQUIRED);
+}
+
+/// Count one failed Withings call.
+pub fn record_withings_failure(stage: &str, code: &str) {
+    WITHINGS_FAILURES_TOTAL
+        .with_label_values(&[stage, code])
+        .inc();
+}
+
+/// Record whether the stored authorisation was just found dead.
+pub fn record_reauthorisation_required(required: bool) {
+    REAUTHORISATION_REQUIRED.set(i64::from(required));
 }
 
 /// Record a finished tool call.

@@ -172,6 +172,39 @@ pub fn latest_per_type(measurements: &[Measurement]) -> Vec<Measurement> {
     latest
 }
 
+/// Where a `getmeas` body says the next page starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// `more` is absent or false: this body ends the range.
+    Last,
+    /// `more` is set, and the next request passes this `offset`.
+    Next(u32),
+    /// `more` is set but there is no usable `offset`, so the rest of the range
+    /// cannot be asked for. The read is partial and must say so.
+    Unreadable,
+}
+
+/// Read Withings' paging fields.
+///
+/// `more` is accepted as a number or a boolean. Anything other than an
+/// explicit "more" is the last page, because an absent field is what a short
+/// range carries.
+#[must_use]
+pub fn next_page(body: &Value) -> Page {
+    let more = match body.get("more") {
+        Some(Value::Bool(more)) => *more,
+        Some(Value::Number(more)) => more.as_i64() != Some(0),
+        _ => false,
+    };
+    if !more {
+        return Page::Last;
+    }
+    body.get("offset")
+        .and_then(Value::as_u64)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .map_or(Page::Unreadable, Page::Next)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -295,6 +328,27 @@ mod tests {
         let latest = latest_per_type(&flatten(&body));
         assert_eq!(latest.len(), 1);
         assert!(latest.iter().all(|m| m.name != "muscle_mass"));
+    }
+
+    #[test]
+    fn paging_follows_more_and_offset() {
+        assert_eq!(next_page(&fixture()), Page::Last);
+        assert_eq!(next_page(&json!({"more": 0, "offset": 0})), Page::Last);
+        assert_eq!(next_page(&json!({"more": false})), Page::Last);
+        assert_eq!(
+            next_page(&json!({"more": 1, "offset": 400})),
+            Page::Next(400)
+        );
+        assert_eq!(
+            next_page(&json!({"more": true, "offset": 7})),
+            Page::Next(7)
+        );
+        // More is promised and there is no way to ask for it.
+        assert_eq!(next_page(&json!({"more": 1})), Page::Unreadable);
+        assert_eq!(
+            next_page(&json!({"more": 1, "offset": -1})),
+            Page::Unreadable
+        );
     }
 
     #[test]

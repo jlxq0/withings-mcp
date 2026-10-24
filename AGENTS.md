@@ -78,6 +78,10 @@ Required regression coverage:
 - a rate limit never arrives as an empty read;
 - `/oauth/callback` is off without a configured `state` and rejects a wrong one
   before exchanging;
+- `/oauth/callback` closes after its window, after one adopted authorisation,
+  and after repeated wrong states, and its query never reaches a log line;
+- a paged range is read to its last page, and one that cannot be finished
+  says `complete: false`;
 - every listed tool is annotated read-only.
 
 ## Known pitfalls
@@ -246,6 +250,48 @@ Required regression coverage:
   origin points this server at their own Withings account, and every subsequent
   read is of a stranger's body metrics while every signal stays green.
 
+- **A configured `state` is necessary and not sufficient.** The value is
+  static and sits in every consent URL, so it is in a browser history and in
+  Withings' logs, and a production probe on 2026-10-24 found the callback
+  answering `403` — on, and accepting a state from anyone who had one.
+  `oauth_gate::CallbackGate` keeps it open for `WITHINGS_MCP_OAUTH_WINDOW_SECS`
+  after startup, closes it on the first adopted authorisation, and closes it
+  after `MAX_STATE_FAILURES` wrong values. Every closed answer is the same
+  `404` as "not configured". The tests are
+  `the_oauth_callback_adopts_once_and_then_answers_as_if_off`,
+  `the_oauth_callback_is_closed_once_its_window_elapses` and
+  `repeated_wrong_states_close_the_oauth_callback`.
+
+  The exchange slot is a `Ticket` released on drop, and the exchange runs in
+  a spawned task that owns it. A browser that disconnects mid-exchange drops
+  the handler future, and a slot released only on the happy path stayed
+  `InFlight` and answered `409` past the window until a restart.
+  `a_callback_abandoned_mid_exchange_still_adopts_and_closes` pins it. Found in
+  independent review, 2026-10-24.
+
+- **The request span records the path, never the URI.** `/oauth/callback`
+  carries the authorisation code and the state in its query, and
+  `TraceLayer`'s default span records the whole URI at `DEBUG`, so a
+  deployment turning logging up would have written both down.
+  `the_callback_query_never_reaches_a_log_line` pins it.
+
+- **`getmeas` pages, and the first page is not the range.** Withings answers a
+  long range with `more` and an `offset`. `WithingsMcpService::measurements`
+  follows them up to `MAX_PAGES`, stops on an offset that does not advance,
+  and every read carries `complete`. `an_endless_range_stops_at_the_page_limit`
+  holds the cap. Before this the first page was reported
+  as the range with `truncated: false`. `a_paged_range_is_read_to_its_last_page`
+  and `a_range_that_cannot_be_finished_says_it_is_partial` pin both halves.
+
+- **A reading nobody asked for never reaches a caller.** `meastypes` asks
+  Withings to filter and `list_measurements` filters again, because
+  `scope=user.metrics` covers more than the four types in the catalogue.
+  `a_reading_nobody_asked_for_is_not_returned` pins it.
+
+- **`serverInfo` is this server, not rmcp.** `ServerInfo::new` fills it from
+  rmcp's own build environment, so a client was told `rmcp` and rmcp's version.
+  `initialize_names_this_server_and_its_version` pins it.
+
 - **`WITHINGS_MCP_ALLOWED_HOSTS` is load-bearing and its default will not serve
   a public deployment.** rmcp validates `Host` against the list and answers
   `403` to anything outside it. The default is `localhost,127.0.0.1,::1` and
@@ -267,6 +313,12 @@ Required regression coverage:
   and `the_defaults_a_deployment_gets_when_it_sets_nothing` construct through
   the no-argument path on purpose. **Setting `DEFAULT_REFRESH_SKEW` to zero
   reds two tests**, measured 2026-08-29.
+
+- **`ci.yml` runs on a daily schedule so a new advisory reds `main`.** On
+  2026-10-24 `cargo audit` found nine advisories against a tree whose last CI
+  run, seventeen days earlier, was green, because nothing had pushed since. The
+  scheduled run is `cargo` only; `docker` is skipped, because a scheduled
+  run's ref is `main` and `main` is the one `:buildcache` writer.
 
 - **The tree builds on rustc 1.93 and lints on clippy 1.98, and those are two
   different floors.** `Cargo.toml`'s `rust-version = "1.93"` and the
@@ -325,5 +377,9 @@ checkable:
    `value`/`unit` encoding assumed in `src/measures.rs`.
 4. The meastype numbers 1, 6, 8 and 76 carry the quantities the catalogue says
    they do.
+5. `getmeas` pages with `more` and `offset` as the client reads them, and the
+   order its pages come in. Only a range long enough to page can show it, and
+   until it is measured `complete: false` means the newest readings may be on
+   a page that was not read.
 
 Update this section when one of them is measured, and say which.
