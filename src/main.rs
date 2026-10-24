@@ -31,7 +31,6 @@ use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Deserialize;
-use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -121,9 +120,14 @@ fn build_app(config: &Config) -> Result<Router> {
         // No userid: it is account content, and this line is in every
         // release's startup log. `no_log_line_carries_a_userid` pins both.
         Some(_) => info!("holding stored Withings tokens"),
-        None => warn!(
-            "no Withings credential: set the seed refresh token, or complete the oauth callback"
-        ),
+        None => {
+            // Said on the gauge as well as in the log, so an alert on it
+            // fires for a pod nobody has called yet.
+            metrics::record_reauthorisation_required(true);
+            warn!(
+                "no Withings credential: set the seed refresh token, or complete the oauth callback"
+            );
+        }
     }
     if let Some(state) = &config.oauth_state {
         // The length only. The value is the callback's whole guard.
@@ -218,8 +222,11 @@ fn build_router(
                     client_secret: config.client_secret.expose().to_owned(),
                 },
                 redirect_uri: config.redirect_uri.clone(),
-                oauth_state: config.oauth_state.clone(),
-                gate: CallbackGate::new(config.oauth_callback_window),
+                expected_state: config
+                    .oauth_state
+                    .as_ref()
+                    .map(|state| ExpectedToken::new(state.expose())),
+                gate: Arc::new(CallbackGate::new(config.oauth_callback_window)),
             })),
         )
         .nest("/mcp", mcp_routes)
@@ -242,8 +249,10 @@ struct CallbackState {
     tokens: Arc<TokenManager>,
     credentials: ClientCredentials,
     redirect_uri: Option<String>,
-    oauth_state: Option<Secret>,
-    gate: CallbackGate,
+    /// Compared by digest, like the bearer, so neither its bytes nor its
+    /// length leak through timing.
+    expected_state: Option<ExpectedToken>,
+    gate: Arc<CallbackGate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,19 +277,18 @@ async fn oauth_callback(
     State(state): State<Arc<CallbackState>>,
     Query(params): Query<CallbackParams>,
 ) -> axum::response::Response {
-    let Some(expected_state) = &state.oauth_state else {
+    let Some(expected_state) = &state.expected_state else {
         return callback_closed();
     };
     if !state.gate.is_open() {
         return callback_closed();
     }
-    let presented = params.state.unwrap_or_default();
-    let matches = presented
-        .as_bytes()
-        .ct_eq(expected_state.expose().as_bytes())
-        .unwrap_u8()
-        == 1;
-    match state.gate.admit(matches) {
+    let Some(presented) = params.state.filter(|presented| !presented.is_empty()) else {
+        // Not a guess, so not counted: otherwise any five scanner hits on the
+        // path would close the callback on the operator.
+        return (StatusCode::FORBIDDEN, "state mismatch\n").into_response();
+    };
+    let mut ticket = match state.gate.admit(expected_state.matches(&presented)) {
         Admission::Closed => return callback_closed(),
         Admission::WrongState => {
             warn!("oauth callback rejected: state mismatch");
@@ -293,11 +301,28 @@ async fn oauth_callback(
             )
                 .into_response();
         }
-        Admission::Proceed => {}
-    }
-    let (response, adopted) = complete_authorisation(&state, params.code).await;
-    state.gate.finish(adopted);
-    response
+        Admission::Proceed(ticket) => ticket,
+    };
+    // Spawned, holding the ticket, so a browser that disconnects mid-exchange
+    // drops only its wait. Dropping the exchange itself would abandon a code
+    // Withings has already consumed, or stop between storing a credential and
+    // closing the callback behind it.
+    let task_state = Arc::clone(&state);
+    let completion = tokio::spawn(async move {
+        let (response, adopted) = complete_authorisation(&task_state, params.code).await;
+        if adopted {
+            ticket.adopted();
+        }
+        drop(ticket);
+        response
+    });
+    completion.await.unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the authorisation did not complete\n",
+        )
+            .into_response()
+    })
 }
 
 /// The answer for a callback that is off, closed, or used. One body for all
@@ -1127,6 +1152,81 @@ mod tests {
         server.verify().await;
     }
 
+    /// A request with no `state` is not a guess. Counting it would let any
+    /// five scanner hits on the path close the callback on the operator.
+    #[tokio::test]
+    async fn a_request_without_a_state_does_not_close_the_callback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_body("acc-9", "rot-9")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = build(&callback_config(&server.uri()));
+        for _ in 0..=oauth_gate::MAX_STATE_FAILURES {
+            assert_eq!(callback(&app, "?code=c").await, StatusCode::FORBIDDEN);
+            assert_eq!(
+                callback(&app, "?code=c&state=").await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            callback(&app, "?code=fresh-code&state=expected-state").await,
+            StatusCode::OK
+        );
+        server.verify().await;
+    }
+
+    /// A browser that gives up mid-exchange drops the handler future. The
+    /// exchange still finishes, the credential is adopted, and the callback
+    /// closes behind it rather than sitting `InFlight` past its window.
+    #[tokio::test]
+    async fn a_callback_abandoned_mid_exchange_still_adopts_and_closes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/oauth2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(token_body("acc-9", "rot-9"))
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = callback_config(&server.uri());
+        let withings = WithingsClient::new(&config.api_base_url).unwrap();
+        let tokens = Arc::new(
+            TokenManager::new(
+                withings.clone(),
+                ClientCredentials {
+                    client_id: config.client_id.clone(),
+                    client_secret: config.client_secret.expose().to_owned(),
+                },
+                Box::new(MemoryStore::new()),
+                None,
+            )
+            .unwrap(),
+        );
+        let app = build_router(
+            &config,
+            withings,
+            Arc::clone(&tokens),
+            &Arc::new(Limiter::new(100).unwrap()),
+        );
+        let query = "?code=fresh-code&state=expected-state";
+        let abandoned = tokio::spawn({
+            let app = app.clone();
+            async move { callback(&app, query).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        abandoned.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(tokens.peek().unwrap().unwrap().refresh_token, "rot-9");
+        assert_eq!(callback(&app, query).await, StatusCode::NOT_FOUND);
+        server.verify().await;
+    }
+
     /// The request span records the path. The query carries an authorisation
     /// code and the state, and the default span would record the whole URI.
     #[tokio::test]
@@ -1259,6 +1359,42 @@ mod tests {
                 assert_eq!(content["truncated"], true, "{envelope}");
             }
         }
+    }
+
+    /// A Withings that keeps promising more is read to the page limit and no
+    /// further, and the result says it is partial.
+    #[tokio::test]
+    async fn an_endless_range_stops_at_the_page_limit() {
+        let server = MockServer::start().await;
+        refreshing(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/measure"))
+            .respond_with(|request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                let offset = body
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("offset="))
+                    .and_then(|offset| offset.parse::<u32>().ok())
+                    .unwrap_or(0);
+                ResponseTemplate::new(200).set_body_json(page(
+                    i64::from(offset) + 1,
+                    70_500,
+                    Some(offset + 1),
+                ))
+            })
+            .expect(u64::try_from(mcp::MAX_PAGES).unwrap())
+            .mount(&server)
+            .await;
+        let envelope = tool_call_envelope(
+            router_with_hosts(&server.uri(), &[ORIGIN]),
+            "list_measurements",
+            r#"{"limit":500}"#,
+        )
+        .await;
+        let content = &envelope["result"]["structuredContent"];
+        assert_eq!(content["complete"], false, "{envelope}");
+        assert_eq!(content["returned"], mcp::MAX_PAGES, "{envelope}");
+        server.verify().await;
     }
 
     /// `meastypes` asks Withings to filter. A reading the caller did not ask

@@ -172,6 +172,13 @@ impl Config {
         if std::env::var(ENV_OAUTH_WINDOW_SECS).is_ok() {
             config.oauth_callback_window =
                 Duration::from_secs(u64::from(parse_rate_limit(ENV_OAUTH_WINDOW_SECS, 0)?));
+            // Longer is a standing door again, which the window exists to
+            // remove.
+            anyhow::ensure!(
+                config.oauth_callback_window <= oauth_gate::MAX_WINDOW,
+                "{ENV_OAUTH_WINDOW_SECS} must be at most {}",
+                oauth_gate::MAX_WINDOW.as_secs()
+            );
         }
         if let Some(redirect_uri) = &config.redirect_uri {
             validate_url(redirect_uri, ENV_REDIRECT_URI)?;

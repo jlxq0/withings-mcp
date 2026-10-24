@@ -75,9 +75,12 @@ URL, so it is gated three ways:
 
 - it is disabled unless `WITHINGS_MCP_OAUTH_STATE` is set, and the `state`
   query parameter must match it;
-- it is open only for `WITHINGS_MCP_OAUTH_WINDOW_SECS` (default 600) after the
-  process starts, and it closes for good on the first authorisation it adopts;
-- it closes after five wrong `state` values.
+- it is open only for `WITHINGS_MCP_OAUTH_WINDOW_SECS` (default 600, at most
+  3600) after the process starts, and it closes for good on the first
+  authorisation it adopts;
+- it closes after five wrong `state` values. A request with no `state` is not
+  counted, but anyone can send five wrong ones, so if it closed before you
+  consented, restart and try again.
 
 Closed, used and disabled all answer the same `404`. To re-authorise, restart
 the process and consent inside the window. Use a long random `state`; one
@@ -111,9 +114,10 @@ were asked for is indistinguishable from a missing measurement.
 
 Withings pages a long range. Both reads follow the pages, up to 20, and say
 `"complete": true` when they reached the last one. `false` means the range had
-more than was read: `list_measurements` then reports `"truncated": true`, and a
-type `latest_measurements` names in `no_reading_in_window` may have a reading
-on a page that was not read.
+more than was read: `list_measurements` then reports `"truncated": true`, and
+neither the newest readings nor `no_reading_in_window` can be trusted, because
+which end of the range Withings pages from has not been measured. Each page is
+a Withings call, so one tool call can make up to 20.
 
 `list_measurements` with a `start` after its `end` is an invalid argument.
 

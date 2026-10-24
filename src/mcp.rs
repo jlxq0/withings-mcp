@@ -39,7 +39,7 @@ const DEFAULT_LIMIT: usize = 50;
 /// page and reporting it as the whole range is the same confident wrongness
 /// as an unscaled value: a series that ends early looks like a person who
 /// stopped measuring.
-const MAX_PAGES: usize = 20;
+pub const MAX_PAGES: usize = 20;
 
 /// Every measurement in a range, and whether that is all of them.
 struct Fetched {
@@ -144,6 +144,7 @@ impl WithingsMcpService {
     ) -> Result<Fetched, WithingsError> {
         let mut query = query.clone();
         let mut measurements = Vec::new();
+        let mut stopped = "page_limit";
         for _ in 0..MAX_PAGES {
             let body = self.withings.get_measures(access_token, &query).await?;
             measurements.extend(measures::flatten(&body));
@@ -158,12 +159,20 @@ impl WithingsMcpService {
                 Page::Next(offset) if query.offset.is_none_or(|previous| offset > previous) => {
                     query.offset = Some(offset);
                 }
-                Page::Next(_) | Page::Unreadable => break,
+                Page::Next(_) => {
+                    stopped = "offset_did_not_advance";
+                    break;
+                }
+                Page::Unreadable => {
+                    stopped = "no_offset";
+                    break;
+                }
             }
         }
         tracing::warn!(
+            stopped,
             max_pages = MAX_PAGES,
-            "getmeas had more pages than were read; the result says it is partial"
+            "getmeas stopped before its last page; the result says it is partial"
         );
         Ok(Fetched {
             measurements,

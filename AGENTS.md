@@ -262,6 +262,13 @@ Required regression coverage:
   `the_oauth_callback_is_closed_once_its_window_elapses` and
   `repeated_wrong_states_close_the_oauth_callback`.
 
+  The exchange slot is a `Ticket` released on drop, and the exchange runs in
+  a spawned task that owns it. A browser that disconnects mid-exchange drops
+  the handler future, and a slot released only on the happy path stayed
+  `InFlight` and answered `409` past the window until a restart.
+  `a_callback_abandoned_mid_exchange_still_adopts_and_closes` pins it. Found in
+  independent review, 2026-10-24.
+
 - **The request span records the path, never the URI.** `/oauth/callback`
   carries the authorisation code and the state in its query, and
   `TraceLayer`'s default span records the whole URI at `DEBUG`, so a
@@ -271,7 +278,8 @@ Required regression coverage:
 - **`getmeas` pages, and the first page is not the range.** Withings answers a
   long range with `more` and an `offset`. `WithingsMcpService::measurements`
   follows them up to `MAX_PAGES`, stops on an offset that does not advance,
-  and every read carries `complete`. Before this the first page was reported
+  and every read carries `complete`. `an_endless_range_stops_at_the_page_limit`
+  holds the cap. Before this the first page was reported
   as the range with `truncated: false`. `a_paged_range_is_read_to_its_last_page`
   and `a_range_that_cannot_be_finished_says_it_is_partial` pin both halves.
 
@@ -369,5 +377,9 @@ checkable:
    `value`/`unit` encoding assumed in `src/measures.rs`.
 4. The meastype numbers 1, 6, 8 and 76 carry the quantities the catalogue says
    they do.
+5. `getmeas` pages with `more` and `offset` as the client reads them, and the
+   order its pages come in. Only a range long enough to page can show it, and
+   until it is measured `complete: false` means the newest readings may be on
+   a page that was not read.
 
 Update this section when one of them is measured, and say which.
