@@ -93,7 +93,10 @@ Required regression coverage:
   keep the Rust builder/MSRV and the external token store contract unchanged.
   Publish the single scanned OCI index with its attestations, never rebuild
   after the scan. Immutable version tags require one authorized writer; the
-  registry tag precheck is not atomic compare-and-swap.
+  registry tag precheck is not atomic compare-and-swap. When reusing a build
+  recipe, preserve the crate-specific `deps/withings_mcp*` cleanup as well as
+  the hyphenated binary name: leaving another crate name can reuse the cached
+  dependency stub. The builder refuses that marker before any image scan.
 
 - **2026-10-29: a clean RustSec audit is not a complete dependency gate.**
   The old lock passed `cargo audit` while OSV reported the SHA-2 buffer,

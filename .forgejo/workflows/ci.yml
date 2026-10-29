@@ -84,7 +84,7 @@ jobs:
     if: github.event_name != 'schedule'
     permissions: { contents: read, packages: write }
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { fetch-depth: 0, persist-credentials: false }
       - name: Install buildctl
         env:
@@ -127,7 +127,7 @@ jobs:
         run: |
           set -euo pipefail
           binary="$(mktemp)"
-          trap 'rm "$binary"' EXIT
+          trap 'rm -f "$binary"' EXIT
           curl --fail --location --silent --show-error -o "$binary" \
             "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64"
           echo "${REGCTL_SHA256}  ${binary}" | sha256sum -c -

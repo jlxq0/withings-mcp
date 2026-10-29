@@ -18,10 +18,15 @@ COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && \
     echo 'fn main() { println!("dep stub"); }' > src/main.rs && \
     cargo build --release --locked && \
-    rm -rf src target/release/deps/hevy_mcp* target/release/withings-mcp*
+    rm -rf src target/release/deps/withings_mcp* target/release/withings-mcp*
 
 COPY src ./src
-RUN cargo build --release --locked
+# Refuse a stale dependency-cache stub before scanning or publishing it.
+RUN cargo build --release --locked \
+    && test -s target/release/withings-mcp \
+    && if grep -aFq 'dep stub' target/release/withings-mcp; then \
+         echo 'dependency stub survived the real build' >&2; exit 1; \
+       else test "$?" -eq 1; fi
 
 # Distroless runtime: no shell, no apt. `cc` variant ships glibc + ca-certs,
 # which we need for HTTPS to Withings.
