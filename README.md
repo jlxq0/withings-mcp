@@ -177,5 +177,28 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo audit
+osv-scanner scan source --lockfile Cargo.lock
 cargo deny check bans licenses sources
 ```
+
+## Release qualification
+
+The next runtime release is `v0.1.4`. It retains the Rust 1.93 builder and
+server-owned token storage, with the current digest-pinned Debian 13 distroless
+runtime. A release tag must match the package version and descend from reviewed
+`main`. Scheduled source audits do not build or write the image cache.
+
+CI solves one OCI artifact with SPDX/SLSA attestations, scans that exact layout
+and configuration for HIGH/CRITICAL findings, then copies the same complete
+index by digest. The version tag cannot replace a different existing artifact;
+`latest` is updated only after digest readback. Attestation presence is not a
+signature, and the tag precheck is not registry compare-and-swap: keep one
+release writer. Pull requests never receive publication credentials or export
+the main cache. Final image and native authenticated readback remain mandatory
+before deployment; test health alone cannot prove upstream authorization.
+
+`python3 scripts/test_publish_oci.py --layout /path/to/oci --digest sha256:...`
+uses a disposable localhost registry and an attested fixture. It verifies every
+previously absent object, identical replay, conflicting version refusal and
+missing descendants without writing to a production registry. Use the same
+checksum-pinned `regctl` as CI.

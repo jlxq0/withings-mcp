@@ -87,6 +87,17 @@ Required regression coverage:
 
 ## Known pitfalls
 
+- **2026-10-29: a dependency-clean binary does not qualify its runtime image.**
+  The old distroless Debian 12 base still carried fixable OpenSSL findings.
+  The fixed Debian 13 base must be scanned as part of the final artifact;
+  keep the Rust builder/MSRV and the external token store contract unchanged.
+  Publish the single scanned OCI index with its attestations, never rebuild
+  after the scan. Immutable version tags require one authorized writer; the
+  registry tag precheck is not atomic compare-and-swap. When reusing a build
+  recipe, preserve the crate-specific `deps/withings_mcp*` cleanup as well as
+  the hyphenated binary name: leaving another crate name can reuse the cached
+  dependency stub. The builder refuses that marker before any image scan.
+
 - **2026-10-29: a clean RustSec audit is not a complete dependency gate.**
   The old lock passed `cargo audit` while OSV reported the SHA-2 buffer,
   OpenTelemetry SDK and MCP SDK advisories. Keep both checks: the fixed

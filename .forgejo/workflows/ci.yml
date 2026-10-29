@@ -80,13 +80,12 @@ jobs:
   docker:
     runs-on: ubuntu-22.04
     needs: cargo
-    # A scheduled run's ref is `main`, which is the `:buildcache` writer
-    # below. It builds nothing new, so it must not write anything either.
+    # Daily source audits must not build or export the main cache.
     if: github.event_name != 'schedule'
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with: { persist-credentials: false }
+        with: { fetch-depth: 0, persist-credentials: false }
       - name: Install buildctl
         env:
           BUILDKIT_VERSION: v0.30.0
@@ -100,55 +99,92 @@ jobs:
           sudo tar -xz -C /usr/local --strip-components=0 -f "$TARBALL"
           rm -f "$TARBALL"
           buildctl --version
+      - name: Install SBOM and vulnerability scanners
+        env:
+          SYFT_VERSION: 1.51.0
+          SYFT_SHA256: 2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f
+          TRIVY_VERSION: 0.74.0
+          TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+        run: |
+          set -euo pipefail
+          SYFT_TARBALL="/tmp/syft.tar.gz"
+          TRIVY_TARBALL="/tmp/trivy.tar.gz"
+          curl -sSL -o "$SYFT_TARBALL" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl -sSL -o "$TRIVY_TARBALL" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${SYFT_SHA256}  ${SYFT_TARBALL}" | sha256sum -c -
+          echo "${TRIVY_SHA256}  ${TRIVY_TARBALL}" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f "$SYFT_TARBALL" syft
+          sudo tar -xz -C /usr/local/bin -f "$TRIVY_TARBALL" trivy
+          rm -f "$SYFT_TARBALL" "$TRIVY_TARBALL"
+          syft version
+          trivy --version
+      - name: Install digest-preserving OCI copier
+        env:
+          REGCTL_VERSION: v0.11.7
+          REGCTL_SHA256: 3737fbbdd791e04e7a831640b681f3397a376498e80e2ad9b1b2d27296f239bc
+        run: |
+          set -euo pipefail
+          binary="$(mktemp)"
+          trap 'rm -f "$binary"' EXIT
+          curl --fail --location --silent --show-error -o "$binary" \
+            "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64"
+          echo "${REGCTL_SHA256}  ${binary}" | sha256sum -c -
+          sudo install -m 0755 "$binary" /usr/local/bin/regctl
+          regctl version
       - name: Login to Forgejo registry
         if: github.event_name != 'pull_request'
         run: |
           mkdir -p ~/.docker
           F_AUTH=$(printf "%s:%s" "jlxq0" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
           echo "{\"auths\":{\"forge.oddie.app\":{\"auth\":\"$F_AUTH\"}}}" > ~/.docker/config.json
-      - name: Build (and push on tag)
+      - name: Build, scan, attest, and push on tag
         run: |
           set -euo pipefail
-          # buildkitd runs on the runner host, listening on 0.0.0.0:1234. From
-          # inside this job container the host is our own bridge gateway — never
-          # a hardcoded IP (those change on reboot/DHCP and differ per repo).
-          # The image is slim (no iproute2), so read the default route from
-          # /proc/net/route via node (always present — actions run on it).
           GW="$(node -e 'const fs=require("fs");for(const l of fs.readFileSync("/proc/net/route","utf8").split("\n").slice(1)){const f=l.trim().split(/\s+/);if(f[1]==="00000000"){const h=f[2];console.log([h.slice(6,8),h.slice(4,6),h.slice(2,4),h.slice(0,2)].map(x=>parseInt(x,16)).join("."));break;}}')"
           export BUILDKIT_HOST="tcp://${GW}:1234"
           echo "buildkitd at ${BUILDKIT_HOST}"
           CACHE_REF="forge.oddie.app/jlxq0/withings-mcp:buildcache"
-          IMPORT_CACHE_ARG=()
-          EXPORT_CACHE_ARG=()
+          LOCAL_TAG="withings-mcp:ci-${GITHUB_SHA::8}"
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            V="${GITHUB_REF#refs/tags/}"
-            TAGS="forge.oddie.app/jlxq0/withings-mcp:${V},forge.oddie.app/jlxq0/withings-mcp:latest"
-            PUSH=true
-            # Import only. A tag build is the same commit as the `main` build
-            # that preceded it — the branch differs only in TAGS and PUSH, which
-            # are output settings and not build inputs — so its cache would be
-            # byte-identical to one already written. Exporting it was pure
-            # duplication, and the duplication was the race. See the comment on
-            # the export below.
-            IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
-          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            TAGS="forge.oddie.app/jlxq0/withings-mcp:ci-${GITHUB_SHA::8}"
-            PUSH=false
-            IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
-            # The only writer. Merging a pull request and pushing the release
-            # tag are two pushes, so two `docker` jobs run at once; both
-            # exporting to one unqualified `:buildcache` ref made one lose the
-            # blob write. One writer removes the race by construction rather
-            # than by scheduling.
-            EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
-          else
-            TAGS="forge.oddie.app/jlxq0/withings-mcp:ci-${GITHUB_SHA::8}"
-            PUSH=false
+            test "${GITHUB_REF#refs/tags/v}" = "$VERSION"
+            git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+            git merge-base --is-ancestor "${GITHUB_REF}^{commit}" origin/main
           fi
+          IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
+          EXPORT_CACHE_ARG=()
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
+          fi
+
+          # Solve once, including attestations; scan and publish these exact bytes.
           buildctl build \
             --frontend dockerfile.v0 \
             --local context=. \
             --local dockerfile=. \
+            --opt platform=linux/amd64 \
+            --opt "build-arg:APP_VERSION=${VERSION}" \
+            --opt "build-arg:VCS_REF=${GITHUB_SHA}" \
             "${IMPORT_CACHE_ARG[@]}" \
             "${EXPORT_CACHE_ARG[@]}" \
-            --output "type=image,\"name=${TAGS}\",push=${PUSH}"
+            --opt attest:provenance=mode=max \
+            --opt attest:sbom= \
+            --metadata-file /tmp/withings-mcp-build-metadata.json \
+            --output "type=oci,dest=/tmp/withings-mcp.oci.tar,name=${LOCAL_TAG}"
+
+          mkdir -p /tmp/withings-mcp.oci
+          tar -xf /tmp/withings-mcp.oci.tar -C /tmp/withings-mcp.oci
+          trivy image --input /tmp/withings-mcp.oci \
+            --severity HIGH,CRITICAL --exit-code 1
+          trivy config . --severity HIGH,CRITICAL --exit-code 1
+          syft "oci-archive:/tmp/withings-mcp.oci.tar" \
+            -o cyclonedx-json=withings-mcp.cdx.json
+          test -s withings-mcp.cdx.json
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            DIGEST="$(jq -e -r '."containerimage.digest"' /tmp/withings-mcp-build-metadata.json)"
+            bash scripts/publish_oci.sh /tmp/withings-mcp.oci "$DIGEST" \
+              forge.oddie.app/jlxq0/withings-mcp "${GITHUB_REF#refs/tags/}"
+          fi
