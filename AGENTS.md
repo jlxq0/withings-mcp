@@ -62,6 +62,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo audit
+osv-scanner scan source --lockfile Cargo.lock
 cargo deny check bans licenses sources
 ```
 
@@ -85,6 +86,18 @@ Required regression coverage:
 - every listed tool is annotated read-only.
 
 ## Known pitfalls
+
+- **2026-10-29: a clean RustSec audit is not a complete dependency gate.**
+  The old lock passed `cargo audit` while OSV reported the SHA-2 buffer,
+  OpenTelemetry SDK and MCP SDK advisories. Keep both checks: the fixed
+  chain is SHA-2 0.11.1 / digest 0.11.3 / block-buffer 0.12.1,
+  OpenTelemetry SDK 0.32.1 and RMCP 2.2.0 in this lock. RMCP 2.2 still
+  requires the existing macro lint allowance (removing it fails Clippy 1.98).
+  The standard digest
+  vectors guard bearer and audit-key output compatibility; the existing real
+  transport, token-rotation, privacy and session tests must also pass. Do not
+  suppress an advisory merely because the application does not intentionally
+  exercise the affected operation. Runtime image qualification is separate.
 
 - **2026-10-29: thread-local test subscribers can silently miss a newly
   registered callsite.** With tracing-core 0.1.36, a callsite first emitted by
