@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           binary="$(mktemp)"
-          trap 'rm "$binary"' EXIT
+          trap 'rm -f "$binary"' EXIT
           curl --fail --location --silent --show-error -o "$binary" \
             "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
           echo "${OSV_SCANNER_SHA256}  ${binary}" | sha256sum -c -
