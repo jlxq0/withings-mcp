@@ -1456,12 +1456,45 @@ mod tests {
         server.verify().await;
     }
 
-    /// Captures every event on this thread as JSON lines.
-    ///
-    /// `#[tokio::test]` runs on one thread, so a thread-local default sees the
-    /// events rmcp's spawned session tasks emit too.
+    /// Captures every event on this thread as JSON lines. One stable global
+    /// subscriber keeps first-use callsite registration independent of which
+    /// parallel test emits first; only the output sink is thread-local.
+    /// `#[tokio::test]` uses a current-thread runtime, including rmcp tasks.
     #[derive(Clone, Default)]
     struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    thread_local! {
+        static CAPTURE: std::cell::RefCell<Option<Captured>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    struct CaptureGuard {
+        previous: Option<Captured>,
+        // Restoring a thread-local sink must happen on the installing thread.
+        _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            // Like tracing's DefaultGuard, nested guards restore in LIFO order.
+            CAPTURE.with(|slot| slot.replace(self.previous.take()));
+        }
+    }
+
+    struct CaptureWriter(Option<Captured>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .as_mut()
+                .map_or(Ok(bytes.len()), |sink| sink.write(bytes))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     impl std::io::Write for Captured {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1475,15 +1508,32 @@ mod tests {
     }
 
     impl Captured {
-        fn install(&self) -> tracing::subscriber::DefaultGuard {
-            let writer = self.clone();
-            tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .json()
-                    .with_max_level(tracing::Level::DEBUG)
-                    .with_writer(move || writer.clone())
-                    .finish(),
-            )
+        fn install(&self) -> CaptureGuard {
+            static SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+            SUBSCRIBER.call_once(|| {
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::fmt()
+                        .json()
+                        .with_max_level(tracing::Level::DEBUG)
+                        .with_writer(|| {
+                            CaptureWriter(
+                                CAPTURE
+                                    .try_with(|slot| slot.borrow().clone())
+                                    .ok()
+                                    .flatten(),
+                            )
+                        })
+                        .finish(),
+                )
+                .unwrap();
+            });
+            // Dispatch registration precedes publication of the global default.
+            // Refresh any callsite first seen during that initial transition.
+            tracing::callsite::rebuild_interest_cache();
+            CaptureGuard {
+                previous: CAPTURE.with(|slot| slot.replace(Some(self.clone()))),
+                _thread_bound: std::marker::PhantomData,
+            }
         }
 
         fn text(&self) -> String {
@@ -1498,6 +1548,86 @@ mod tests {
                 .filter(|event| event["fields"]["message"] == "Withings call failed")
                 .map(|event| event["fields"].clone())
                 .collect()
+        }
+    }
+
+    /// A callsite first used by a non-capturing test thread must still emit
+    /// when a later caller captures it. Run in a fresh process so another
+    /// test's subscriber cannot accidentally make the regression pass.
+    #[test]
+    fn capture_observes_a_callsite_first_used_outside_its_thread() {
+        fn emit() {
+            tracing::warn!("invented capture regression marker");
+        }
+        const CHILD: &str = "WITHINGS_TEST_CAPTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::capture_observes_a_callsite_first_used_outside_its_thread",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "isolated capture regression did not pass exactly one test: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let captured = Captured::default();
+        let _guard = captured.install();
+        std::thread::spawn(emit).join().unwrap();
+        emit();
+        assert_eq!(
+            captured
+                .text()
+                .matches("invented capture regression marker")
+                .count(),
+            1,
+            "a callsite first used without capture stayed disabled: {}",
+            captured.text()
+        );
+    }
+
+    #[test]
+    fn capture_keeps_parallel_threads_and_nested_sinks_separate() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = ["invented-alpha", "invented-beta"]
+            .into_iter()
+            .map(|marker| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let outer = Captured::default();
+                    let _outer = outer.install();
+                    barrier.wait();
+                    tracing::warn!(marker, "outer-before");
+                    let inner = Captured::default();
+                    {
+                        let _inner = inner.install();
+                        tracing::warn!(marker, "inner-only");
+                    }
+                    tracing::warn!(marker, "outer-after");
+                    let other = if marker == "invented-alpha" {
+                        "invented-beta"
+                    } else {
+                        "invented-alpha"
+                    };
+                    assert!(!outer.text().contains(other));
+                    assert!(!inner.text().contains(other));
+                    assert!(outer.text().contains("outer-before"));
+                    assert!(outer.text().contains("outer-after"));
+                    assert!(!outer.text().contains("inner-only"));
+                    assert!(inner.text().contains("inner-only"));
+                    assert!(!inner.text().contains("outer-"));
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
         }
     }
 
