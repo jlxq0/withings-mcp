@@ -93,8 +93,11 @@ Required regression coverage:
   no log event even though its JSON-RPC error is correct. Repeated whole-suite
   passes did not reproduce it; the fresh-process regression
   `capture_observes_a_callsite_first_used_outside_its_thread` does. Tests now
-  use one stable global subscriber and thread-local output sinks, with nested
-  restoration and parallel isolation checked separately. Keep the positive
+  use one stable global subscriber and thread-local output sinks, refreshing
+  callsite interest on each capture after global-subscriber publication. Nested
+  restoration and parallel isolation are checked separately. The fresh-process
+  test requires exactly one child test to pass, so a renamed filter cannot
+  silently run zero tests. Keep the positive
   event-count assertions alongside the privacy assertions: an empty capture
   is not evidence that logging is safe. Production logging is unchanged.
 

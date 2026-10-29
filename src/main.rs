@@ -1477,6 +1477,7 @@ mod tests {
 
     impl Drop for CaptureGuard {
         fn drop(&mut self) {
+            // Like tracing's DefaultGuard, nested guards restore in LIFO order.
             CAPTURE.with(|slot| slot.replace(self.previous.take()));
         }
     }
@@ -1514,11 +1515,21 @@ mod tests {
                     tracing_subscriber::fmt()
                         .json()
                         .with_max_level(tracing::Level::DEBUG)
-                        .with_writer(|| CaptureWriter(CAPTURE.with(|slot| slot.borrow().clone())))
+                        .with_writer(|| {
+                            CaptureWriter(
+                                CAPTURE
+                                    .try_with(|slot| slot.borrow().clone())
+                                    .ok()
+                                    .flatten(),
+                            )
+                        })
                         .finish(),
                 )
                 .unwrap();
             });
+            // Dispatch registration precedes publication of the global default.
+            // Refresh any callsite first seen during that initial transition.
+            tracing::callsite::rebuild_interest_cache();
             CaptureGuard {
                 previous: CAPTURE.with(|slot| slot.replace(Some(self.clone()))),
                 _thread_bound: std::marker::PhantomData,
@@ -1550,16 +1561,21 @@ mod tests {
         }
         const CHILD: &str = "WITHINGS_TEST_CAPTURE_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "tests::capture_observes_a_callsite_first_used_outside_its_thread",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success(), "isolated capture regression failed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "isolated capture regression did not pass exactly one test: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         let captured = Captured::default();
@@ -1572,7 +1588,8 @@ mod tests {
                 .matches("invented capture regression marker")
                 .count(),
             1,
-            "a callsite first used without capture stayed disabled"
+            "a callsite first used without capture stayed disabled: {}",
+            captured.text()
         );
     }
 
